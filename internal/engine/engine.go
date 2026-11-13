@@ -15,26 +15,38 @@ type Journal interface {
 	AppendExpireAt(key string, deadlineMS int64) error
 }
 
-// Engine은 클라이언트 명령을 하나의 고루틴에서 차례로 실행한다.
+// Engine은 클라이언트 명령과 복제 작업을 하나의 고루틴에서 차례로 실행한다.
 type Engine struct {
 	requests chan func(*state)
 	done     chan struct{}
 }
 
 // state에 대한 읽기와 쓰기는 실행 고루틴 한 곳에서만 일어난다.
+// 복제본에서 db가 nil이면 아직 첫 스냅샷을 다 받지 못한 상태다.
 type state struct {
-	db      *store.Store
-	journal Journal
+	db          *store.Store
+	journal     Journal
+	follower    bool
+	subscribers map[chan store.Entry]struct{}
 }
 
 func New(ctx context.Context) *Engine {
 	return NewWithStore(ctx, store.New(), nil)
 }
 
-// NewWithStore는 시작 시 준비한 키 공간의 소유권을 실행 고루틴에 넘긴다.
+// NewWithStore는 시작 시 준비한 키 공간의 소유권을 primary 실행 고루틴에 넘긴다.
 func NewWithStore(ctx context.Context, db *store.Store, journal Journal) *Engine {
+	return start(ctx, &state{db: db, journal: journal, subscribers: make(map[chan store.Entry]struct{})})
+}
+
+// NewFollower는 첫 전체 동기화를 기다리는 읽기 전용 실행기를 만든다.
+func NewFollower(ctx context.Context) *Engine {
+	return start(ctx, &state{follower: true})
+}
+
+func start(ctx context.Context, s *state) *Engine {
 	e := &Engine{requests: make(chan func(*state)), done: make(chan struct{})}
-	go e.run(ctx, &state{db: db, journal: journal})
+	go e.run(ctx, s)
 	return e
 }
 
@@ -45,9 +57,14 @@ func (e *Engine) run(ctx context.Context, s *state) {
 	for {
 		select {
 		case <-ctx.Done():
+			for ch := range s.subscribers {
+				close(ch)
+			}
 			return
 		case <-sweep.C:
-			s.db.PurgeExpired(20)
+			if s.db != nil {
+				s.db.PurgeExpired(20)
+			}
 		case work := <-e.requests:
 			work(s)
 		}
@@ -76,7 +93,7 @@ func (e *Engine) Execute(command resp.Value) (reply resp.Value, ok bool) {
 	return reply, ok
 }
 
-// Wait는 실행기가 종료될 때까지 기다린다.
+// Wait는 실행기가 구독 채널까지 정리하고 종료될 때까지 기다린다.
 func (e *Engine) Wait() {
 	<-e.done
 }

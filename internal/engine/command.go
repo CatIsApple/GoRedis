@@ -21,7 +21,14 @@ func (s *state) execute(command resp.Value) resp.Value {
 	}
 
 	name := args[0].Bytes
-
+	if s.follower {
+		switch {
+		case commandIs(name, "SET"), commandIs(name, "EXPIRE"):
+			return commandError("READONLY You can't write against a read only replica")
+		case s.db == nil && (commandIs(name, "GET") || commandIs(name, "TTL")):
+			return commandError("LOADING Replica is waiting for its initial snapshot")
+		}
+	}
 	switch {
 	case commandIs(name, "PING"):
 		if len(args) == 2 {
@@ -41,6 +48,7 @@ func (s *state) execute(command resp.Value) resp.Value {
 			return commandError("MISCONF failed to persist write to AOF")
 		}
 		s.db.Set(key, value)
+		s.publish(key)
 		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("OK")}
 	case commandIs(name, "GET"):
 		if len(args) != 2 {
@@ -75,6 +83,7 @@ func (s *state) execute(command resp.Value) resp.Value {
 			return commandError("MISCONF failed to persist write to AOF")
 		}
 		s.db.SetExpiryAt(key, deadline)
+		s.publish(key)
 		return resp.Value{Kind: resp.Integer, Int: 1}
 	case commandIs(name, "TTL"):
 		if len(args) != 2 {
