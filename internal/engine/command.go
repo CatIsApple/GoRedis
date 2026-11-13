@@ -5,11 +5,11 @@ import (
 	"strconv"
 
 	"github.com/CatIsApple/GoRedis/internal/resp"
-	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
 // execute는 연결이 해석한 RESP 배열에서 첫 원소를 명령 이름으로, 나머지를 인자로 읽는다.
-func execute(db *store.Store, command resp.Value) resp.Value {
+// 명령 형식과 인자 수를 확인한 뒤에만 키 공간이나 AOF를 변경한다.
+func (s *state) execute(command resp.Value) resp.Value {
 	args := command.Elements
 	if command.Kind != resp.Array || len(args) == 0 {
 		return commandError("ERR expected a non-empty command array")
@@ -21,6 +21,7 @@ func execute(db *store.Store, command resp.Value) resp.Value {
 	}
 
 	name := args[0].Bytes
+
 	switch {
 	case commandIs(name, "PING"):
 		if len(args) == 2 {
@@ -35,13 +36,17 @@ func execute(db *store.Store, command resp.Value) resp.Value {
 			return wrongArity("set")
 		}
 		key, value := string(args[1].Bytes), string(args[2].Bytes)
-		db.Set(key, value)
+		// 로그 기록이 실패하면 기존 값과 TTL을 보존하고 이 요청에는 오류를 돌려준다.
+		if s.journal != nil && s.journal.AppendSet(key, value) != nil {
+			return commandError("MISCONF failed to persist write to AOF")
+		}
+		s.db.Set(key, value)
 		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("OK")}
 	case commandIs(name, "GET"):
 		if len(args) != 2 {
 			return wrongArity("get")
 		}
-		value, found := db.Get(string(args[1].Bytes))
+		value, found := s.db.Get(string(args[1].Bytes))
 		// 없는 키는 Bytes가 nil인 bulk string($-1), 저장된 빈 문자열은 길이 0인 bulk string($0)이다.
 		if !found {
 			return resp.Value{Kind: resp.BulkString}
@@ -57,19 +62,25 @@ func execute(db *store.Store, command resp.Value) resp.Value {
 			return commandError("ERR value is not an integer or out of range")
 		}
 		key := string(args[1].Bytes)
-		applied, err := db.Expire(key, seconds)
+		// 10초 뒤 만료되는 키를 3초 후 복구하면 약 7초가 남아야 한다.
+		// 여기서 한 번 계산한 절대 시각을 디스크와 메모리 양쪽에 똑같이 적용한다.
+		deadline, found, err := s.db.PrepareExpiry(key, seconds)
 		if err != nil {
 			return commandError("ERR invalid expire time in 'expire' command")
 		}
-		if applied {
-			return resp.Value{Kind: resp.Integer, Int: 1}
+		if !found {
+			return resp.Value{Kind: resp.Integer, Int: 0}
 		}
-		return resp.Value{Kind: resp.Integer, Int: 0}
+		if s.journal != nil && s.journal.AppendExpireAt(key, deadline) != nil {
+			return commandError("MISCONF failed to persist write to AOF")
+		}
+		s.db.SetExpiryAt(key, deadline)
+		return resp.Value{Kind: resp.Integer, Int: 1}
 	case commandIs(name, "TTL"):
 		if len(args) != 2 {
 			return wrongArity("ttl")
 		}
-		return resp.Value{Kind: resp.Integer, Int: db.TTL(string(args[1].Bytes))}
+		return resp.Value{Kind: resp.Integer, Int: s.db.TTL(string(args[1].Bytes))}
 	default:
 		return commandError("ERR unknown command")
 	}

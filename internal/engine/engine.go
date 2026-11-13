@@ -8,27 +8,38 @@ import (
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
-// 각 연결은 같은 requests 채널에 명령을 보내고, 요청에 담긴 reply 채널로 결과를 받는다.
-type request struct {
-	command resp.Value
-	reply   chan resp.Value
+// Journal은 SET과 EXPIRE의 결과를 재시작 후 복원할 수 있도록 기록한다.
+// 두 메서드가 성공하면 실행기는 메모리에 같은 변경을 적용하고 클라이언트에 응답한다.
+type Journal interface {
+	AppendSet(key, value string) error
+	AppendExpireAt(key string, deadlineMS int64) error
 }
 
-// Engine은 한 서버의 모든 연결에서 제출한 명령을 하나의 고루틴에서 실행한다.
+// Engine은 클라이언트 명령을 하나의 고루틴에서 차례로 실행한다.
 type Engine struct {
-	requests chan request
+	requests chan func(*state)
 	done     chan struct{}
 }
 
+// state에 대한 읽기와 쓰기는 실행 고루틴 한 곳에서만 일어난다.
+type state struct {
+	db      *store.Store
+	journal Journal
+}
+
 func New(ctx context.Context) *Engine {
-	e := &Engine{requests: make(chan request), done: make(chan struct{})}
-	go e.run(ctx)
+	return NewWithStore(ctx, store.New(), nil)
+}
+
+// NewWithStore는 시작 시 준비한 키 공간의 소유권을 실행 고루틴에 넘긴다.
+func NewWithStore(ctx context.Context, db *store.Store, journal Journal) *Engine {
+	e := &Engine{requests: make(chan func(*state)), done: make(chan struct{})}
+	go e.run(ctx, &state{db: db, journal: journal})
 	return e
 }
 
-func (e *Engine) run(ctx context.Context) {
+func (e *Engine) run(ctx context.Context, s *state) {
 	defer close(e.done)
-	db := store.New()
 	sweep := time.NewTicker(100 * time.Millisecond)
 	defer sweep.Stop()
 	for {
@@ -36,26 +47,36 @@ func (e *Engine) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-sweep.C:
-			// 한 번에 확인하는 키 수를 제한해 다음 명령에 실행 기회를 준다.
-			db.PurgeExpired(20)
-		case req := <-e.requests:
-			req.reply <- execute(db, req.command)
+			s.db.PurgeExpired(20)
+		case work := <-e.requests:
+			work(s)
 		}
+	}
+}
+
+// call은 한 작업이 결과를 기록할 때까지 기다린다. 각 호출이 자기 finished를
+// 사용하므로 동시 요청의 응답이 섞이지 않는다. 닫기는 수신자를 기다리지 않는다.
+func (e *Engine) call(work func(*state)) bool {
+	finished := make(chan struct{})
+	select {
+	case e.requests <- func(s *state) {
+		work(s)
+		close(finished)
+	}:
+		<-finished
+		return true
+	case <-e.done:
+		return false
 	}
 }
 
 // Execute는 명령의 응답을 기다린다. 실행기가 종료됐으면 ok는 false다.
 func (e *Engine) Execute(command resp.Value) (reply resp.Value, ok bool) {
-	req := request{command: command, reply: make(chan resp.Value, 1)}
-	select {
-	case e.requests <- req:
-		return <-req.reply, true
-	case <-e.done:
-		return resp.Value{}, false
-	}
+	ok = e.call(func(s *state) { reply = s.execute(command) })
+	return reply, ok
 }
 
-// Wait는 실행기 고루틴이 종료될 때까지 기다린다.
+// Wait는 실행기가 종료될 때까지 기다린다.
 func (e *Engine) Wait() {
 	<-e.done
 }

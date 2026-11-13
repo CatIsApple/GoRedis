@@ -9,29 +9,55 @@ import (
 	"sync"
 
 	"github.com/CatIsApple/GoRedis/internal/engine"
+	"github.com/CatIsApple/GoRedis/internal/persist"
 	"github.com/CatIsApple/GoRedis/internal/resp"
+	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
 // ListenAndServe는 addr에 TCP 리스너를 열고 클라이언트 연결을 받는다.
-func ListenAndServe(ctx context.Context, addr string) error {
+func ListenAndServe(ctx context.Context, addr, aofPath string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	return Serve(ctx, listener)
+	return ServeWithAOF(ctx, listener, aofPath)
 }
 
 // Serve는 주어진 리스너를 사용해 메모리 전용 서버를 실행한다.
 // 리스너의 소유권은 서버로 넘어가며 종료 시 열린 연결과 함께 닫힌다.
 func Serve(ctx context.Context, listener net.Listener) error {
+	return ServeWithAOF(ctx, listener, "")
+}
+
+// ServeWithAOF는 복구를 마친 뒤 요청을 받는다. 빈 경로면 메모리에서만 실행한다.
+func ServeWithAOF(ctx context.Context, listener net.Listener, path string) (err error) {
+	db := store.New()
+	var journal engine.Journal
+	if path != "" {
+		// 같은 db에 AOF를 처음부터 재생한다. 복구가 끝나야 아래 Accept 루프에
+		// 진입하므로 클라이언트가 복구 중인 키 공간을 읽을 수 없다.
+		aof, err := persist.Open(path, db)
+		if err != nil {
+			listener.Close()
+			return err
+		}
+		journal = aof
+		defer func() {
+			if closeErr := aof.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
+		}()
+	}
 	ctx, cancel := context.WithCancel(ctx)
-	executor := engine.New(ctx)
+	executor := engine.NewWithStore(ctx, db, journal)
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		<-ctx.Done()
 		listener.Close() // Accept의 대기를 해제한다.
 	})
 	defer func() {
+		// 먼저 연결을 깨우고, 연결 고루틴과 실행기가 끝나기를 기다린다.
+		// 앞에서 등록한 aof.Close는 defer의 역순 실행에 따라 그 뒤에 호출된다.
 		cancel()
 		wg.Wait()
 		executor.Wait()
@@ -47,13 +73,15 @@ func Serve(ctx context.Context, listener net.Listener) error {
 			return err
 		}
 		// Accept 루프는 이 연결의 요청을 기다리지 않고 다음 접속을 받는다.
+		// 각 연결 고루틴은 같은 executor를 사용하므로 모든 연결이 키 공간을 공유한다.
 		wg.Go(func() { handleConn(ctx, conn, executor) })
 	}
 }
 
 func handleConn(ctx context.Context, conn net.Conn, executor *engine.Engine) {
 	defer conn.Close()
-	// 서버 종료 때 소켓을 닫으면 이 연결에서 대기 중인 읽기도 깨어난다.
+	// 서버 종료 때 소켓을 닫으면 ReadValue나 Flush에서 대기 중인 연결도 깨어난다.
+	// 연결이 먼저 끝나면 stop으로 종료 콜백을 해제한다.
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
@@ -63,6 +91,8 @@ func handleConn(ctx context.Context, conn net.Conn, executor *engine.Engine) {
 	for {
 		command, err := reader.ReadValue()
 		if err != nil {
+			// 메시지 사이의 EOF는 클라이언트가 정상적으로 끊은 경우다.
+			// 프레임이 잘렸거나 형식이 깨졌다면 오류 응답을 시도한 뒤 이 연결을 끝낸다.
 			if errors.Is(err, resp.ErrProtocol) || errors.Is(err, io.ErrUnexpectedEOF) {
 				writeReply(writer, resp.Value{Kind: resp.SimpleError, Bytes: []byte("ERR Protocol error")})
 			}
