@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"strconv"
 
 	"github.com/CatIsApple/GoRedis/internal/resp"
 	"github.com/CatIsApple/GoRedis/internal/store"
@@ -46,6 +47,29 @@ func execute(db *store.Store, command resp.Value) resp.Value {
 			return resp.Value{Kind: resp.BulkString}
 		}
 		return resp.Value{Kind: resp.BulkString, Bytes: []byte(value)}
+	case commandIs(name, "EXPIRE"):
+		if len(args) != 3 {
+			return wrongArity("expire")
+		}
+		raw := string(args[2].Bytes)
+		seconds, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || strconv.FormatInt(seconds, 10) != raw {
+			return commandError("ERR value is not an integer or out of range")
+		}
+		key := string(args[1].Bytes)
+		applied, err := db.Expire(key, seconds)
+		if err != nil {
+			return commandError("ERR invalid expire time in 'expire' command")
+		}
+		if applied {
+			return resp.Value{Kind: resp.Integer, Int: 1}
+		}
+		return resp.Value{Kind: resp.Integer, Int: 0}
+	case commandIs(name, "TTL"):
+		if len(args) != 2 {
+			return wrongArity("ttl")
+		}
+		return resp.Value{Kind: resp.Integer, Int: db.TTL(string(args[1].Bytes))}
 	default:
 		return commandError("ERR unknown command")
 	}
