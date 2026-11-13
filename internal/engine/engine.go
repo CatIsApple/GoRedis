@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/CatIsApple/GoRedis/internal/resp"
+	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
 // 각 연결은 같은 requests 채널에 명령을 보내고, 요청에 담긴 reply 채널로 결과를 받는다.
@@ -26,12 +27,13 @@ func New(ctx context.Context) *Engine {
 
 func (e *Engine) run(ctx context.Context) {
 	defer close(e.done)
+	db := store.New()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case req := <-e.requests:
-			req.reply <- execute(req.command)
+			req.reply <- execute(db, req.command)
 		}
 	}
 }
