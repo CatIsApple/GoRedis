@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/CatIsApple/GoRedis/internal/engine"
 	"github.com/CatIsApple/GoRedis/internal/resp"
 )
 
@@ -24,6 +25,7 @@ func ListenAndServe(ctx context.Context, addr string) error {
 // 리스너의 소유권은 서버로 넘어가며 종료 시 열린 연결과 함께 닫힌다.
 func Serve(ctx context.Context, listener net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
+	executor := engine.New(ctx)
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		<-ctx.Done()
@@ -32,6 +34,7 @@ func Serve(ctx context.Context, listener net.Listener) error {
 	defer func() {
 		cancel()
 		wg.Wait()
+		executor.Wait()
 	}()
 
 	log.Printf("GoRedis listening on %s", listener.Addr())
@@ -44,11 +47,11 @@ func Serve(ctx context.Context, listener net.Listener) error {
 			return err
 		}
 		// Accept 루프는 이 연결의 요청을 기다리지 않고 다음 접속을 받는다.
-		wg.Go(func() { handleConn(ctx, conn) })
+		wg.Go(func() { handleConn(ctx, conn, executor) })
 	}
 }
 
-func handleConn(ctx context.Context, conn net.Conn) {
+func handleConn(ctx context.Context, conn net.Conn, executor *engine.Engine) {
 	defer conn.Close()
 	// 서버 종료 때 소켓을 닫으면 이 연결에서 대기 중인 읽기도 깨어난다.
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
@@ -58,16 +61,17 @@ func handleConn(ctx context.Context, conn net.Conn) {
 	reader := resp.NewReader(conn)
 	writer := resp.NewWriter(conn)
 	for {
-		_, err := reader.ReadValue()
+		command, err := reader.ReadValue()
 		if err != nil {
 			if errors.Is(err, resp.ErrProtocol) || errors.Is(err, io.ErrUnexpectedEOF) {
 				writeReply(writer, resp.Value{Kind: resp.SimpleError, Bytes: []byte("ERR Protocol error")})
 			}
 			return
 		}
-		// 다음 단계에서 단일 실행기에 요청을 전달한다.
-		reply := resp.Value{Kind: resp.SimpleError, Bytes: []byte("ERR command execution not implemented")}
-		if writeReply(writer, reply) != nil {
+		// 여기서 완성된 명령 하나를 넘기고 그 결과를 기다린다. 현재 응답을
+		// 쓴 뒤 다음 요청으로 넘어가므로 같은 연결의 파이프라인 순서가 보존된다.
+		reply, ok := executor.Execute(command)
+		if !ok || writeReply(writer, reply) != nil {
 			return
 		}
 	}
