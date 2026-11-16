@@ -13,9 +13,9 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:6379", "TCP listen address")
-	// 상대 경로는 서버를 실행한 디렉터리 기준이다. 재시작할 때 같은 파일을
-	// 지정하면 이전 명령을 재생해 키와 만료 시각을 되살릴 수 있다.
-	aofPath := flag.String("aof", "appendonly.aof", "append-only file path (empty for in-memory mode)")
+	// 경로의 디렉터리와 이름을 기준으로 RDB, 증분 AOF, manifest를 찾는다.
+	aofPath := flag.String("aof", "appendonly.aof", "persistence path for RDB and incremental AOF (empty for in-memory mode)")
+	fsync := flag.String("appendfsync", "everysec", "incremental AOF fsync policy: always, everysec or no")
 	primary := flag.String("replicaof", "", "follow this GoRedis primary (host:port) as a read-only replica")
 	flag.Parse()
 
@@ -36,7 +36,7 @@ func main() {
 		}
 		return
 	}
-	if err := server.ListenAndServe(ctx, *addr, *aofPath); err != nil {
+	if err := server.ListenAndServeWithFsync(ctx, *addr, *aofPath, *fsync); err != nil {
 		log.Fatal(err)
 	}
 }
