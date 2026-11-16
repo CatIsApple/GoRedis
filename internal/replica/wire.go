@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/CatIsApple/GoRedis/internal/engine"
 	"github.com/CatIsApple/GoRedis/internal/resp"
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
@@ -13,9 +14,14 @@ import (
 const SyncCommand = "GOREDIS.SYNC"
 
 const (
-	fullSync = "FULLSYNC"
-	ready    = "READY"
-	ping     = "PING"
+	fullSync       = "FULLSYNC"
+	ready          = "READY"
+	ping           = "PING"
+	del            = "DEL"
+	mset           = "MSET"
+	hash           = "HASH"
+	hset           = "HSET"
+	hashBlockPairs = 1024
 	// 변경이 없을 때에도 보내는 PING 간격보다 길게 잡는다.
 	frameTimeout = 30 * time.Second
 )
@@ -28,7 +34,7 @@ func isMarker(frame resp.Value, name string) bool {
 	return frame.Kind == resp.SimpleString && string(frame.Bytes) == name
 }
 
-// 각 변경은 해당 키의 최종 상태를 담는다. 세 번째 원소는 절대 만료 시각(ms)이며,
+// 문자열과 삭제는 기존 세 원소 프레임으로 보낸다. 세 번째 원소는 절대 만료 시각(ms)이며,
 // 0은 영구 키다. 삭제는 null 값으로 인코딩해 길이 0인 실제 값과 구별한다.
 func entryFrame(entry store.Entry) resp.Value {
 	value := resp.Value{Kind: resp.BulkString}
@@ -54,11 +60,143 @@ func parseEntry(frame resp.Value) (store.Entry, error) {
 	return store.Entry{Key: string(key.Bytes), Value: string(value.Bytes), ExpiresAt: expiry.Int, Deleted: value.Bytes == nil}, nil
 }
 
-func writeFrame(conn net.Conn, w *resp.Writer, frame resp.Value) error {
+// 다중 명령은 [+DEL, $key, ...] 또는 [+MSET, $key, $value, ...]로 보낸다.
+// 첫 원소의 RESP 자료형이 단일 키 프레임의 벌크 문자열과 구분된다.
+func changeFrame(change engine.Change) resp.Value {
+	var args []resp.Value
+	switch {
+	case len(change.SetPairs) != 0:
+		args = make([]resp.Value, 1, 1+2*len(change.SetPairs))
+		args[0] = marker(mset)
+		for _, pair := range change.SetPairs {
+			args = append(args, resp.Value{Kind: resp.BulkString, Bytes: []byte(pair.Key)},
+				resp.Value{Kind: resp.BulkString, Bytes: []byte(pair.Value)})
+		}
+	case len(change.DeletedKeys) != 0:
+		args = make([]resp.Value, 1, len(change.DeletedKeys)+1)
+		args[0] = marker(del)
+		for _, key := range change.DeletedKeys {
+			args = append(args, resp.Value{Kind: resp.BulkString, Bytes: []byte(key)})
+		}
+	default:
+		return entryFrame(change.Entry)
+	}
+	return resp.Value{Kind: resp.Array, Elements: args}
+}
+
+func parseChange(frame resp.Value) (engine.Change, error) {
+	args := frame.Elements
+	if frame.Kind != resp.Array || len(args) == 0 || args[0].Kind != resp.SimpleString {
+		entry, err := parseEntry(frame)
+		return engine.Change{Entry: entry}, err
+	}
+	for _, arg := range args[1:] {
+		if arg.Kind != resp.BulkString || arg.Bytes == nil {
+			return engine.Change{}, errors.New("replication stream: expected a non-null bulk string")
+		}
+	}
+	switch string(args[0].Bytes) {
+	case mset:
+		if len(args) < 3 || len(args)%2 == 0 {
+			return engine.Change{}, errors.New("replication stream: MSET requires key-value pairs")
+		}
+		pairs := make([]store.Pair, 0, len(args)/2)
+		for i := 1; i < len(args); i += 2 {
+			pairs = append(pairs, store.Pair{Key: string(args[i].Bytes), Value: string(args[i+1].Bytes)})
+		}
+		return engine.Change{SetPairs: pairs}, nil
+	case del:
+		if len(args) < 2 {
+			return engine.Change{}, errors.New("replication stream: DEL requires a key")
+		}
+		keys := make([]string, 0, len(args)-1)
+		for _, key := range args[1:] {
+			keys = append(keys, string(key.Bytes))
+		}
+		return engine.Change{DeletedKeys: keys}, nil
+	default:
+		return engine.Change{}, errors.New("replication stream: unknown change")
+	}
+}
+
+// 해시는 [종류, 키, 절대 만료 시각, 필드 쌍 개수] 뒤에 필드·값 블록이 이어진다.
+// 여러 HSET으로 자란 해시도 RESP 배열 하나의 길이 제한에 걸리지 않는다.
+// HASH는 전체 교체, HSET은 기존 해시에서 지정한 필드만 갱신한다.
+func writeChange(conn net.Conn, w *resp.Writer, change engine.Change) error {
+	entry := change.Entry
+	if entry.Hash == nil {
+		return bufferFrame(conn, w, changeFrame(change))
+	}
+	kind := hash
+	if change.HashUpdate {
+		kind = hset
+	}
+	header := resp.Value{Kind: resp.Array, Elements: []resp.Value{
+		marker(kind), {Kind: resp.BulkString, Bytes: []byte(entry.Key)},
+		{Kind: resp.Integer, Int: entry.ExpiresAt}, {Kind: resp.Integer, Int: int64(len(entry.Hash))},
+	}}
+	if err := bufferFrame(conn, w, header); err != nil {
+		return err
+	}
+	for fields := entry.Hash; len(fields) > 0; {
+		n := min(len(fields), hashBlockPairs)
+		block := make([]resp.Value, 0, 2*n)
+		for _, field := range fields[:n] {
+			block = append(block, resp.Value{Kind: resp.BulkString, Bytes: []byte(field.Key)},
+				resp.Value{Kind: resp.BulkString, Bytes: []byte(field.Value)})
+		}
+		if err := bufferFrame(conn, w, resp.Value{Kind: resp.Array, Elements: block}); err != nil {
+			return err
+		}
+		fields = fields[n:]
+	}
+	return nil
+}
+
+func readChange(conn net.Conn, r *resp.Reader, frame resp.Value) (engine.Change, error) {
+	args := frame.Elements
+	if len(args) == 0 || (!isMarker(args[0], hash) && !isMarker(args[0], hset)) {
+		return parseChange(frame)
+	}
+	if len(args) != 4 || args[1].Kind != resp.BulkString || args[1].Bytes == nil ||
+		args[2].Kind != resp.Integer || args[2].Int < 0 || args[3].Kind != resp.Integer || args[3].Int <= 0 {
+		return engine.Change{}, errors.New("replication stream: invalid hash header")
+	}
+
+	// 헤더의 개수를 믿고 메모리를 미리 할당하지 않는다. 마지막 블록까지
+	// 모두 도착하고 형식이 올바를 때만 실행기에 전달한다.
+	entry := store.Entry{Key: string(args[1].Bytes), ExpiresAt: args[2].Int}
+	for remaining := args[3].Int; remaining > 0; {
+		block, err := readFrame(conn, r)
+		if err != nil {
+			return engine.Change{}, err
+		}
+		elements := block.Elements
+		n := len(elements) / 2
+		if block.Kind != resp.Array || len(elements)%2 != 0 || n == 0 || n > hashBlockPairs || int64(n) > remaining {
+			return engine.Change{}, errors.New("replication stream: invalid hash block size")
+		}
+		for i := 0; i < len(elements); i += 2 {
+			field, value := elements[i], elements[i+1]
+			if field.Kind != resp.BulkString || field.Bytes == nil || value.Kind != resp.BulkString || value.Bytes == nil {
+				return engine.Change{}, errors.New("replication stream: expected non-null hash field and value")
+			}
+			entry.Hash = append(entry.Hash, store.Pair{Key: string(field.Bytes), Value: string(value.Bytes)})
+		}
+		remaining -= int64(n)
+	}
+	return engine.Change{Entry: entry, HashUpdate: isMarker(args[0], hset)}, nil
+}
+
+func bufferFrame(conn net.Conn, w *resp.Writer, frame resp.Value) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(frameTimeout)); err != nil {
 		return err
 	}
-	if err := w.WriteValue(frame); err != nil {
+	return w.WriteValue(frame)
+}
+
+func writeFrame(conn net.Conn, w *resp.Writer, frame resp.Value) error {
+	if err := bufferFrame(conn, w, frame); err != nil {
 		return err
 	}
 	return w.Flush()
