@@ -335,14 +335,3 @@ func (r *rdbDecoder) payload(n uint64) []byte {
 	r.err = err
 	return data
 }
-
-func endOfRDB(r *bufio.Reader) error {
-	_, err := r.Peek(1)
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
-	if err == nil {
-		return errors.New("unexpected bytes after RDB checksum")
-	}
-	return err
-}

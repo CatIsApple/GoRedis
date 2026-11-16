@@ -14,39 +14,15 @@ import (
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
-// AOF는 단일 실행기가 소유하는 Append Only File이다. 한 명령은 RESP 배열
-// 하나로 기록하므로 키와 값에 개행이나 NUL 바이트가 있어도 경계를 복원할 수 있다.
+// AOF는 실행기가 현재 증분 파일에 쓰고, 재작성 작업자가 별도 RDB 파일을 만드는 영속화 저장소다.
+// 클라이언트의 쓰기 한 건은 하나 이상의 RESP 배열로 기록하므로
+// 키, 필드, 값에 개행이나 NUL 바이트가 있어도 경계를 복원할 수 있다.
 type AOF struct {
+	generations
 	syncPolicy
 	file   *os.File
 	writer *resp.Writer
 	failed error
-}
-
-// Open은 빈 키 공간에 AOF를 처음부터 재생한 다음, 같은 파일을 쓰기용으로
-// 넘긴다. 오류를 반환하면 호출자는 부분적으로 복구된 키 공간을 버린다.
-func Open(path string, db *store.Store) (*AOF, error) {
-	return OpenWithFsync(path, db, "everysec")
-}
-
-func OpenWithFsync(path string, db *store.Store, policy string) (*AOF, error) {
-	if err := validateFsync(policy); err != nil {
-		return nil, err
-	}
-	f, err := openLockedFile(path)
-	if err != nil {
-		return nil, err
-	}
-	if err := replay(f, db, true); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("replay AOF %s: %w", path, err)
-	}
-	// 이전 만료 시각을 뒤의 명령이 연장했을 수 있다. 전체 재생이 끝난 시점의
-	// 최종 기한을 기준으로, 서버가 꺼져 있는 동안 만료된 키까지 정리한다.
-	db.PurgeExpired(math.MaxInt)
-	a := &AOF{file: f, writer: resp.NewWriter(f)}
-	a.startFsync(policy)
-	return a, nil
 }
 
 type tailMode uint8
@@ -411,9 +387,4 @@ func (a *AOF) append(commands ...[]string) error {
 		return a.failed
 	}
 	return nil
-}
-
-func (a *AOF) Close() error {
-	a.stopFsync()
-	return errors.Join(a.syncFile(a.file), a.file.Close())
 }
