@@ -38,6 +38,18 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 			return commandError(readOnlyError)
 		}
 		return s.set(args, now)
+	case commandIs(name, "MSET"):
+		if len(args) < 3 {
+			return wrongArity("mset")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		// Redis는 최소 인자 수와 쓰기 권한을 확인한 뒤 키·값 쌍이 맞는지 검사한다.
+		if len(args)%2 == 0 {
+			return wrongArity("mset")
+		}
+		return s.mset(args[1:])
 	case commandIs(name, "INCR"):
 		if len(args) != 2 {
 			return wrongArity("incr")
@@ -77,6 +89,14 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 			return commandError(loadingError)
 		}
 		return checkedBulkReply(s.db.StringAt(string(args[1].Bytes), now))
+	case commandIs(name, "MGET"):
+		if len(args) < 2 {
+			return wrongArity("mget")
+		}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		return s.mget(args[1:], now)
 	case commandIs(name, "TYPE"):
 		if len(args) != 2 {
 			return wrongArity("type")
