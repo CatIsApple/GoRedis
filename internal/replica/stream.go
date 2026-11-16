@@ -25,10 +25,7 @@ func Stream(ctx context.Context, conn net.Conn, executor *engine.Engine) {
 	for _, entry := range snapshot {
 		// 스냅샷을 전부 받아야 조회에 쓰이므로 작은 키마다 Flush하지 않고
 		// RESP 버퍼에 모아 보낸다. 마지막 READY가 남은 바이트까지 내보낸다.
-		if err := conn.SetWriteDeadline(time.Now().Add(frameTimeout)); err != nil {
-			return
-		}
-		if err := w.WriteValue(entryFrame(entry)); err != nil {
+		if err := writeChange(conn, w, engine.Change{Entry: entry}); err != nil {
 			return
 		}
 	}
@@ -41,22 +38,25 @@ func Stream(ctx context.Context, conn net.Conn, executor *engine.Engine) {
 	heartbeat := time.NewTicker(2 * time.Second)
 	defer heartbeat.Stop()
 	for {
-		var frame resp.Value
 		select {
 		case <-ctx.Done():
 			return
 		case <-heartbeat.C:
-			frame = marker(ping)
-		case entry, open := <-changes:
+			if err := writeFrame(conn, w, marker(ping)); err != nil {
+				return
+			}
+		case change, open := <-changes:
 			if !open {
 				// 구독 큐가 가득 차면 실행기는 이 구독을 종료한다. 연결을 닫으면
 				// replica가 새 스냅샷을 요청해 빠진 변경까지 복구한다.
 				return
 			}
-			frame = entryFrame(entry)
-		}
-		if err := writeFrame(conn, w, frame); err != nil {
-			return
+			if err := writeChange(conn, w, change); err != nil {
+				return
+			}
+			if err := w.Flush(); err != nil {
+				return
+			}
 		}
 	}
 }
