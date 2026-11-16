@@ -82,12 +82,12 @@ func receive(conn net.Conn, executor *engine.Engine) error {
 		if staging == nil && isMarker(frame, ping) {
 			continue
 		}
-		change, err := parseChange(frame)
+		change, err := readChange(conn, reader, frame)
 		if err != nil {
 			return err
 		}
 		if staging != nil {
-			if change.Entry.Deleted || len(change.SetPairs) != 0 || len(change.DeletedKeys) != 0 {
+			if change.Entry.Deleted || change.HashUpdate || len(change.SetPairs) != 0 || len(change.DeletedKeys) != 0 {
 				return errors.New("replication stream: snapshot requires a complete entry")
 			}
 			staging.ApplyEntry(change.Entry)

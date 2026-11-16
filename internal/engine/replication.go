@@ -1,13 +1,17 @@
 package engine
 
 import (
+	"time"
+
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
 // Change는 primary에서 실행을 마친 명령 한 건이다. 단일 키는 Entry로,
 // 다중 DEL과 MSET은 각각 삭제 목록과 키·값 쌍으로 한 번에 전달한다.
+// HashUpdate이면 Entry.Hash에는 이번 HSET이 쓴 필드만 들어 있다.
 type Change struct {
 	Entry       store.Entry
+	HashUpdate  bool
 	DeletedKeys []string
 	SetPairs    []store.Pair
 }
@@ -44,6 +48,15 @@ func (s *state) publish(key string) {
 	// EXPIRE도 값과 기한을 함께 보낸다. 복제본에서 이전 기한이 먼저 지났어도
 	// 뒤늦게 도착한 연장 통지로 primary의 최신 값을 복원할 수 있다.
 	s.broadcast(Change{Entry: s.db.Entry(key)})
+}
+
+// 처음 생성한 해시는 이전 키를 통째로 교체한다. 이미 존재하던 해시의 HSET은
+// 요청에 들어온 필드만 보내므로 필드 하나를 바꿀 때 전체 맵을 복사하지 않는다.
+func (s *state) publishHash(key string, fields []store.Pair, create bool, deadline int64) {
+	s.broadcast(Change{
+		Entry:      store.Entry{Key: key, Hash: fields, ExpiresAt: deadline},
+		HashUpdate: !create,
+	})
 }
 
 func (s *state) publishDeleted(keys []string) {
@@ -101,6 +114,20 @@ func (e *Engine) ApplyReplica(change Change) (applied bool) {
 			return
 		}
 		switch {
+		case change.HashUpdate:
+			entry := change.Entry
+			now := time.Now().UnixMilli()
+			kind := s.db.TypeAt(entry.Key, now)
+			if kind == "none" && entry.ExpiresAt != 0 && entry.ExpiresAt <= now {
+				// 복제본에서도 기한이 지난 키의 필드는 다시 만들지 않는다.
+				break
+			}
+			// HSET은 기존 해시와 그 만료 시각을 보존한다. 바탕이 되는 상태가
+			// 다르면 일부 필드만으로 복구할 수 없어 재동기화한다.
+			if kind != "hash" || s.db.ExpiresAt(entry.Key) != entry.ExpiresAt {
+				return
+			}
+			s.db.HSet(entry.Key, entry.Hash)
 		case len(change.SetPairs) != 0:
 			s.db.SetMany(change.SetPairs)
 		case len(change.DeletedKeys) != 0:
