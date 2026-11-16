@@ -2,8 +2,11 @@ package engine
 
 import (
 	"bytes"
+	"errors"
+	"log"
 	"strconv"
 
+	"github.com/CatIsApple/GoRedis/internal/persist"
 	"github.com/CatIsApple/GoRedis/internal/resp"
 )
 
@@ -30,6 +33,21 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 			return wrongArity("ping")
 		}
 		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("PONG")}
+	case commandIs(name, "BGREWRITEAOF"):
+		if len(args) != 1 {
+			return wrongArity("bgrewriteaof")
+		}
+		if s.rewriter == nil {
+			return commandError("ERR AOF persistence is disabled")
+		}
+		if err := s.rewriter.Rewrite(s.db); err != nil {
+			if errors.Is(err, persist.ErrRewriteInProgress) {
+				return commandError("ERR Background append only file rewriting already in progress")
+			}
+			log.Printf("BGREWRITEAOF: %v", err)
+			return commandError("ERR Can't execute an AOF background rewriting. Please check the server logs for more information.")
+		}
+		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("Background append only file rewriting started")}
 	case commandIs(name, "SET"):
 		if len(args) < 3 {
 			return wrongArity("set")

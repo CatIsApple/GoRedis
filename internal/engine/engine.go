@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"log"
 	"time"
 
+	"github.com/CatIsApple/GoRedis/internal/persist"
 	"github.com/CatIsApple/GoRedis/internal/resp"
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
@@ -19,6 +21,14 @@ type Journal interface {
 	AppendExpireAt(key string, deadlineMS int64) error
 }
 
+// 스냅샷 경계를 명령 사이에 잡아야 같은 변경이 RDB와 증분 AOF에 중복되지 않는다.
+type rewriter interface {
+	ShouldRewrite() bool
+	Rewrite(db *store.Store) error
+}
+
+var _ rewriter = (*persist.AOF)(nil)
+
 // Engine은 클라이언트 명령과 복제 작업을 하나의 고루틴에서 차례로 실행한다.
 type Engine struct {
 	requests chan func(*state)
@@ -30,6 +40,7 @@ type Engine struct {
 type state struct {
 	db          *store.Store
 	journal     Journal
+	rewriter    rewriter
 	follower    bool
 	subscribers map[chan Change]struct{}
 }
@@ -40,7 +51,8 @@ func New(ctx context.Context) *Engine {
 
 // NewWithStore는 시작 시 준비한 키 공간의 소유권을 primary 실행 고루틴에 넘긴다.
 func NewWithStore(ctx context.Context, db *store.Store, journal Journal) *Engine {
-	return start(ctx, &state{db: db, journal: journal, subscribers: make(map[chan Change]struct{})})
+	r, _ := journal.(rewriter)
+	return start(ctx, &state{db: db, journal: journal, rewriter: r, subscribers: make(map[chan Change]struct{})})
 }
 
 // NewFollower는 첫 전체 동기화를 기다리는 읽기 전용 실행기를 만든다.
@@ -68,6 +80,11 @@ func (e *Engine) run(ctx context.Context, s *state) {
 		case <-sweep.C:
 			if s.db != nil {
 				s.db.PurgeExpired(20)
+			}
+			if s.rewriter != nil && s.rewriter.ShouldRewrite() {
+				if err := s.rewriter.Rewrite(s.db); err != nil {
+					log.Printf("automatic AOF rewrite: %v", err)
+				}
 			}
 		case work := <-e.requests:
 			work(s)
