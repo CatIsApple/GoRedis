@@ -38,6 +38,29 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 			return commandError(readOnlyError)
 		}
 		return s.set(args, now)
+	case commandIs(name, "DEL"):
+		if len(args) < 2 {
+			return wrongArity("del")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		return s.del(args[1:], now)
+	case commandIs(name, "EXISTS"):
+		if len(args) < 2 {
+			return wrongArity("exists")
+		}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		// EXISTS a a는 살아 있는 a를 두 번 센다. 모든 인자는 같은 시점으로 조회한다.
+		var count int64
+		for _, arg := range args[1:] {
+			if s.db.ExistsAt(string(arg.Bytes), now) {
+				count++
+			}
+		}
+		return resp.Value{Kind: resp.Integer, Int: count}
 	case commandIs(name, "GET"):
 		if len(args) != 2 {
 			return wrongArity("get")
@@ -101,6 +124,31 @@ const (
 	integerError  = "ERR value is not an integer or out of range"
 	journalError  = "MISCONF failed to persist write to AOF"
 )
+
+// DEL은 존재하는 서로 다른 키만 기록하고 센다. 먼저 삭제 대상을 정하면 AOF
+// 기록에 실패해도 아직 메모리를 바꾸지 않았으므로 한 명령 전체가 적용되지 않는다.
+func (s *state) del(args []resp.Value, now int64) resp.Value {
+	seen := make(map[string]struct{})
+	var keys []string
+	for _, arg := range args {
+		key := string(arg.Bytes)
+		if _, duplicate := seen[key]; duplicate || !s.db.ExistsAt(key, now) {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(keys) > 0 {
+		if s.journal != nil && s.journal.AppendDel(keys) != nil {
+			return commandError(journalError)
+		}
+		for _, key := range keys {
+			s.db.Delete(key)
+		}
+		s.publishDeleted(keys)
+	}
+	return resp.Value{Kind: resp.Integer, Int: int64(len(keys))}
+}
 
 // Redis 정수 인자는 부호 +, 선행 0, -0을 허용하지 않는다.
 func parseInt(text string) (int64, bool) {

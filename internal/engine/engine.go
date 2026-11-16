@@ -13,6 +13,7 @@ import (
 type Journal interface {
 	AppendSet(key, value string) error
 	AppendSetExpireAt(key, value string, deadlineMS int64) error
+	AppendDel(keys []string) error
 	AppendExpireAt(key string, deadlineMS int64) error
 }
 
