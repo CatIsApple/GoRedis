@@ -51,7 +51,7 @@ func Stream(ctx context.Context, conn net.Conn, executor *engine.Engine) {
 				// replica가 새 스냅샷을 요청해 빠진 변경까지 복구한다.
 				return
 			}
-			if err := bufferFrame(conn, w, entryFrame(change.Entry)); err != nil {
+			if err := bufferFrame(conn, w, changeFrame(change)); err != nil {
 				return
 			}
 			if err := w.Flush(); err != nil {

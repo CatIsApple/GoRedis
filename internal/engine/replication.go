@@ -4,9 +4,12 @@ import (
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
-// Change는 primary에서 실행을 마친 한 키의 변경을 담는다.
+// Change는 primary에서 실행을 마친 명령 한 건이다. 단일 키는 Entry로,
+// 다중 DEL과 MSET은 각각 삭제 목록과 키·값 쌍으로 한 번에 전달한다.
 type Change struct {
-	Entry store.Entry
+	Entry       store.Entry
+	DeletedKeys []string
+	SetPairs    []store.Pair
 }
 
 // Subscribe는 같은 실행 차례에 스냅샷을 만들고 구독을 등록한다. 스냅샷을
@@ -43,6 +46,28 @@ func (s *state) publish(key string) {
 	s.broadcast(Change{Entry: s.db.Entry(key)})
 }
 
+func (s *state) publishDeleted(keys []string) {
+	switch len(keys) {
+	case 0:
+		return
+	case 1:
+		s.broadcast(Change{Entry: store.Entry{Key: keys[0], Deleted: true}})
+	default:
+		// 명령이 만든 삭제 목록은 이후 수정하지 않으므로 모든 구독자가 함께 읽을 수 있다.
+		s.broadcast(Change{DeletedKeys: keys})
+	}
+}
+
+func (s *state) publishMSet(pairs []store.Pair) {
+	if len(pairs) == 1 {
+		s.publish(pairs[0].Key)
+		return
+	}
+	// 실행이 끝난 인자 목록은 이후 바뀌지 않는다. 모든 구독자가 MSET 한 건을
+	// 같은 순서로 받으므로 중복 키의 최종 값도 primary와 일치한다.
+	s.broadcast(Change{SetPairs: pairs})
+}
+
 func (s *state) broadcast(change Change) {
 	for ch := range s.subscribers {
 		select {
@@ -68,13 +93,23 @@ func (e *Engine) ReplaceReplica(db *store.Store) (applied bool) {
 	return applied
 }
 
-// ApplyReplica는 연결에서 받은 변경을 복제본의 실행기로 보낸다.
+// ApplyReplica는 변경 한 건을 실행기에 맡긴다. MSET이나 DEL의 모든 키를
+// 반영한 뒤에야 다른 클라이언트의 MGET 같은 조회 명령을 실행한다.
 func (e *Engine) ApplyReplica(change Change) (applied bool) {
 	e.call(func(s *state) {
 		if !s.follower || s.db == nil {
 			return
 		}
-		s.db.ApplyEntry(change.Entry)
+		switch {
+		case len(change.SetPairs) != 0:
+			s.db.SetMany(change.SetPairs)
+		case len(change.DeletedKeys) != 0:
+			for _, key := range change.DeletedKeys {
+				s.db.Delete(key)
+			}
+		default:
+			s.db.ApplyEntry(change.Entry)
+		}
 		applied = true
 	})
 	return applied

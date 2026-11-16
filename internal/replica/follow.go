@@ -82,17 +82,19 @@ func receive(conn net.Conn, executor *engine.Engine) error {
 		if staging == nil && isMarker(frame, ping) {
 			continue
 		}
-		entry, err := parseEntry(frame)
+		change, err := parseChange(frame)
 		if err != nil {
 			return err
 		}
 		if staging != nil {
-			if entry.Deleted {
-				return errors.New("replication stream: deletion inside snapshot")
+			if change.Entry.Deleted || len(change.SetPairs) != 0 || len(change.DeletedKeys) != 0 {
+				return errors.New("replication stream: snapshot requires a complete entry")
 			}
-			staging.ApplyEntry(entry)
-		} else if !executor.ApplyReplica(engine.Change{Entry: entry}) {
-			return errors.New("replica executor unavailable")
+			staging.ApplyEntry(change.Entry)
+			continue
+		}
+		if !executor.ApplyReplica(change) {
+			return errors.New("replica cannot apply change")
 		}
 	}
 }
