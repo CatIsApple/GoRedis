@@ -38,6 +38,14 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 			return commandError(readOnlyError)
 		}
 		return s.set(args, now)
+	case commandIs(name, "INCR"):
+		if len(args) != 2 {
+			return wrongArity("incr")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		return s.incr(string(args[1].Bytes), now)
 	case commandIs(name, "DEL"):
 		if len(args) < 2 {
 			return wrongArity("del")
