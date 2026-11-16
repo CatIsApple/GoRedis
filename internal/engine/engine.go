@@ -14,6 +14,7 @@ type Journal interface {
 	AppendSet(key, value string) error
 	AppendSetExpireAt(key, value string, deadlineMS int64) error
 	AppendMSet(pairs []store.Pair) error
+	AppendHSet(key string, fields []store.Pair, create bool) error
 	AppendDel(keys []string) error
 	AppendExpireAt(key string, deadlineMS int64) error
 }

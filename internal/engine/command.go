@@ -50,6 +50,17 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 			return wrongArity("mset")
 		}
 		return s.mset(args[1:])
+	case commandIs(name, "HSET"):
+		if len(args) < 4 {
+			return wrongArity("hset")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		if len(args)%2 != 0 {
+			return wrongArity("hset")
+		}
+		return s.hset(string(args[1].Bytes), args[2:], now)
 	case commandIs(name, "INCR"):
 		if len(args) != 2 {
 			return wrongArity("incr")
@@ -89,6 +100,14 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 			return commandError(loadingError)
 		}
 		return checkedBulkReply(s.db.StringAt(string(args[1].Bytes), now))
+	case commandIs(name, "HGET"):
+		if len(args) != 3 {
+			return wrongArity("hget")
+		}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		return checkedBulkReply(s.db.HGetAt(string(args[1].Bytes), string(args[2].Bytes), now))
 	case commandIs(name, "MGET"):
 		if len(args) < 2 {
 			return wrongArity("mget")
