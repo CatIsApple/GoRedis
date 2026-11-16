@@ -28,6 +28,18 @@ func (s *Store) Get(key string) (string, bool) {
 	return s.lookup(key, time.Now().UnixMilli())
 }
 
+// ExistsAt은 만료된 키를 없는 것으로 센다. 여러 키를 읽는 명령은 동일한 now를
+// 전달해, 반복된 키의 기한이 순회 도중 지나도 한 시점의 결과를 돌려준다.
+func (s *Store) ExistsAt(key string, now int64) bool {
+	_, found := s.lookup(key, now)
+	return found
+}
+
+// ExpiresAt은 저장된 절대 만료 시각(ms)을 반환한다. 만료 설정이 없으면 0이다.
+func (s *Store) ExpiresAt(key string) int64 {
+	return s.deadlines[key]
+}
+
 // Expire는 키의 만료 시간을 갱신한다. 0초 이하이면 키를 바로 삭제한다.
 func (s *Store) Expire(key string, seconds int64) (bool, error) {
 	deadline, found, err := s.PrepareExpiry(key, seconds)
@@ -40,22 +52,34 @@ func (s *Store) Expire(key string, seconds int64) (bool, error) {
 // PrepareExpiry는 명령 시점에 키가 존재하는지와 기록할 절대 만료 시각을 계산한다.
 // 0은 즉시 삭제를 뜻한다. 계산된 시각은 AOF와 실제 키 공간에 함께 사용한다.
 func (s *Store) PrepareExpiry(key string, seconds int64) (int64, bool, error) {
-	now := time.Now().UnixMilli()
+	return s.PrepareExpiryAt(key, seconds, time.Now().UnixMilli())
+}
+
+func (s *Store) PrepareExpiryAt(key string, seconds, now int64) (int64, bool, error) {
+	deadline, err := ExpiryDeadline(now, seconds)
+	if err != nil || !s.ExistsAt(key, now) {
+		return 0, false, err
+	}
+	return deadline, true, nil
+}
+
+// ExpiryDeadline은 EXPIRE와 SET EX에 공통으로 쓰는 절대 만료 시각을 계산한다.
+// 곱셈과 덧셈 전에 범위를 확인해 아주 큰 초 값이 과거 시각으로 바뀌는 일을 막는다.
+func ExpiryDeadline(now, seconds int64) (int64, error) {
 	if seconds < math.MinInt64/1000 || seconds > math.MaxInt64/1000 || (seconds > 0 && now > math.MaxInt64-seconds*1000) {
-		return 0, false, errors.New("expiration time out of range")
+		return 0, errors.New("expiration time out of range")
 	}
-	_, found := s.lookup(key, now)
-	if !found || seconds <= 0 {
-		return 0, found, nil
+	if seconds <= 0 {
+		return 0, nil
 	}
-	return now + seconds*1000, true, nil
+	return now + seconds*1000, nil
 }
 
 // SetExpiryAt은 키에 Unix 밀리초 만료 시각을 적용한다. AOF를 재생할 때
 // 뒤에 오는 EXPIRE가 기한을 연장할 수 있으므로 현재 시각과는 비교하지 않는다.
 func (s *Store) SetExpiryAt(key string, deadline int64) {
 	if deadline <= 0 {
-		s.remove(key)
+		s.Delete(key)
 		return
 	}
 	if _, found := s.values[key]; found {
@@ -65,9 +89,11 @@ func (s *Store) SetExpiryAt(key string, deadline int64) {
 
 // TTL은 남은 초를 반올림해 반환한다. 키가 없으면 -2, 만료 설정이 없으면 -1이다.
 func (s *Store) TTL(key string) int64 {
-	now := time.Now().UnixMilli()
-	_, found := s.lookup(key, now)
-	if !found {
+	return s.TTLAt(key, time.Now().UnixMilli())
+}
+
+func (s *Store) TTLAt(key string, now int64) int64 {
+	if !s.ExistsAt(key, now) {
 		return -2
 	}
 	deadline, expires := s.deadlines[key]
@@ -88,7 +114,7 @@ func (s *Store) PurgeExpired(limit int) {
 			break
 		}
 		if deadline <= now {
-			s.remove(key)
+			s.Delete(key)
 		}
 		limit--
 	}
@@ -97,14 +123,15 @@ func (s *Store) PurgeExpired(limit int) {
 func (s *Store) lookup(key string, now int64) (string, bool) {
 	// 주기적인 정리가 아직 이 키에 도달하지 않았어도, 지금 만료됐다면 이 조회에서 바로 제거한다.
 	if deadline, expires := s.deadlines[key]; expires && deadline <= now {
-		s.remove(key)
+		s.Delete(key)
 		return "", false
 	}
 	value, found := s.values[key]
 	return value, found
 }
 
-func (s *Store) remove(key string) {
+// Delete는 값과 만료 정보를 함께 제거한다. AOF 재생에서도 삭제 당시의 결과를 그대로 적용한다.
+func (s *Store) Delete(key string) {
 	delete(s.values, key)
 	delete(s.deadlines, key)
 }

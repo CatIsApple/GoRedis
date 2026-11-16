@@ -27,7 +27,11 @@ func (s *Store) entryAt(key string, now int64) Entry {
 // Entries는 한 시점에 살아 있는 키만 복사한다. 결과의 문자열은 불변이라
 // 다른 고루틴이 스냅샷을 전송하는 동안에도 실행기는 자기 맵을 갱신할 수 있다.
 func (s *Store) Entries() []Entry {
-	now := time.Now().UnixMilli()
+	return s.EntriesAt(time.Now().UnixMilli())
+}
+
+// EntriesAt은 전달된 명령 시각 기준으로 만료를 정리하고 독립적인 사본을 반환한다.
+func (s *Store) EntriesAt(now int64) []Entry {
 	entries := make([]Entry, 0, len(s.values))
 	for key := range s.values {
 		entry := s.entryAt(key, now)
@@ -42,11 +46,11 @@ func (s *Store) Entries() []Entry {
 // 이미 지나간 시각이라면 네트워크에서 보낸 시간만큼 키가 더 살아나는 일을 막는다.
 func (s *Store) ApplyEntry(entry Entry) {
 	if entry.Deleted || (entry.ExpiresAt != 0 && entry.ExpiresAt <= time.Now().UnixMilli()) {
-		s.remove(entry.Key)
+		s.Delete(entry.Key)
 		return
 	}
 	s.Set(entry.Key, entry.Value)
 	if entry.ExpiresAt != 0 {
-		s.deadlines[entry.Key] = entry.ExpiresAt
+		s.SetExpiryAt(entry.Key, entry.ExpiresAt)
 	}
 }
