@@ -1,6 +1,10 @@
 package cluster
 
-import "strings"
+import (
+	"crypto/sha1"
+	"encoding/hex"
+	"strings"
+)
 
 const slotCount = 16384
 
@@ -41,4 +45,9 @@ func KeySlot(key string) int {
 // 첫 슬롯은 ceil(i*slotCount/n)이고 마지막은 다음 샤드의 첫 슬롯 바로 전이다.
 func firstSlot(i, n int) int {
 	return (i*slotCount + n - 1) / n
+}
+
+func nodeID(addr string) string {
+	id := sha1.Sum([]byte(addr))
+	return hex.EncodeToString(id[:])
 }
