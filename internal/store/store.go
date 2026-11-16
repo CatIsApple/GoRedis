@@ -14,6 +14,12 @@ type Store struct {
 	deadlines map[string]int64 // 만료가 설정된 키의 Unix 밀리초
 }
 
+// Pair는 MSET의 키·값 또는 HSET의 필드·값 한 쌍이다. 명령 인자 순서로 적용한다.
+type Pair struct {
+	Key   string
+	Value string
+}
+
 func New() *Store {
 	return &Store{values: make(map[string]string), deadlines: make(map[string]int64)}
 }
@@ -22,6 +28,13 @@ func (s *Store) Set(key, value string) {
 	s.values[key] = value
 	// 덮어쓴 값이 예전 값의 만료 시각에 함께 사라지지 않도록 기한도 지운다.
 	delete(s.deadlines, key)
+}
+
+// SetMany는 각 키를 입력 순서대로 덮어쓰고 그 키의 기존 TTL을 해제한다.
+func (s *Store) SetMany(pairs []Pair) {
+	for _, pair := range pairs {
+		s.Set(pair.Key, pair.Value)
+	}
 }
 
 func (s *Store) Get(key string) (string, bool) {
