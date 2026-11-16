@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"time"
 
 	"github.com/CatIsApple/GoRedis/internal/resp"
+	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
 // 각 연결은 같은 requests 채널에 명령을 보내고, 요청에 담긴 reply 채널로 결과를 받는다.
@@ -26,12 +28,18 @@ func New(ctx context.Context) *Engine {
 
 func (e *Engine) run(ctx context.Context) {
 	defer close(e.done)
+	db := store.New()
+	sweep := time.NewTicker(100 * time.Millisecond)
+	defer sweep.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-sweep.C:
+			// 한 번에 확인하는 키 수를 제한해 다음 명령에 실행 기회를 준다.
+			db.PurgeExpired(20)
 		case req := <-e.requests:
-			req.reply <- execute(req.command)
+			req.reply <- execute(db, req.command)
 		}
 	}
 }

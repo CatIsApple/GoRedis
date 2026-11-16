@@ -1,6 +1,6 @@
 # GoRedis
 
-Go로 Redis를 구현하는 학습 프로젝트입니다. 각 TCP 연결에서 RESP2 요청을 읽고 서버의 단일 실행기에서 명령을 하나씩 실행합니다. 현재 지원하는 명령은 `PING [message]`입니다.
+Go로 Redis를 구현하는 학습 프로젝트입니다. 각 TCP 연결에서 RESP2 요청을 읽고 서버의 단일 실행기에서 명령을 하나씩 실행합니다. `PING [message]`, `SET key value`, `GET key`, `EXPIRE key seconds`, `TTL key`를 지원합니다.
 
 ## 개발 환경
 
@@ -18,3 +18,15 @@ go vet ./...           # 정적 검사
 printf '*1\r\n$4\r\nPING\r\n' | nc -w 1 127.0.0.1 6379
 # +PONG
 ```
+
+아래 두 명령은 각각 새 TCP 연결을 엽니다. 첫 번째 연결에서 저장한 값을 두 번째 연결에서 읽을 수 있습니다.
+
+```sh
+printf '*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nalice\r\n' | nc -w 1 127.0.0.1 6379
+# +OK
+printf '*2\r\n$3\r\nGET\r\n$4\r\nname\r\n' | nc -w 1 127.0.0.1 6379
+# $5
+# alice
+```
+
+`EXPIRE name 1`은 기존 키에 1초 만료를 설정하고 정수 1을 반환합니다. 키가 없으면 0을 반환합니다. 만료 시각부터 모든 연결의 `GET name`은 null을 반환합니다. `TTL name`은 남은 시간(초), 만료 설정이 없는 키에는 -1, 없는 키에는 -2를 반환합니다. 같은 키에 다시 `SET`하면 기존 만료 설정이 해제됩니다.
