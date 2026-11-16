@@ -31,20 +31,13 @@ func (s *state) execute(command resp.Value, now int64) resp.Value {
 		}
 		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("PONG")}
 	case commandIs(name, "SET"):
-		if len(args) != 3 {
+		if len(args) < 3 {
 			return wrongArity("set")
 		}
 		if s.follower {
 			return commandError(readOnlyError)
 		}
-		key, value := string(args[1].Bytes), string(args[2].Bytes)
-		// 로그 기록이 실패하면 기존 값과 TTL을 보존하고 이 요청에는 오류를 돌려준다.
-		if s.journal != nil && s.journal.AppendSet(key, value) != nil {
-			return commandError(journalError)
-		}
-		s.db.Set(key, value)
-		s.publish(key)
-		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("OK")}
+		return s.set(args, now)
 	case commandIs(name, "GET"):
 		if len(args) != 2 {
 			return wrongArity("get")

@@ -8,10 +8,11 @@ import (
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
-// Journal은 SET과 EXPIRE의 결과를 재시작 후 복원할 수 있도록 기록한다.
-// 두 메서드가 성공하면 실행기는 메모리에 같은 변경을 적용하고 클라이언트에 응답한다.
+// Journal은 한 쓰기 명령으로 생긴 변경을 현재 증분 AOF에 기록한다.
+// 기록에 성공하면 실행기가 메모리에 같은 변경을 적용하고 클라이언트에 응답한다.
 type Journal interface {
 	AppendSet(key, value string) error
+	AppendSetExpireAt(key, value string, deadlineMS int64) error
 	AppendExpireAt(key string, deadlineMS int64) error
 }
 
