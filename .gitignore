@@ -2,3 +2,4 @@
 /goredis
 /appendonly.aof
 /appendonlydir/
+/cluster-data/
