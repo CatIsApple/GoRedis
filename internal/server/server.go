@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/CatIsApple/GoRedis/internal/cluster"
 	"github.com/CatIsApple/GoRedis/internal/engine"
 	"github.com/CatIsApple/GoRedis/internal/persist"
 	"github.com/CatIsApple/GoRedis/internal/replica"
@@ -40,6 +41,21 @@ func ListenAndServeReplica(ctx context.Context, addr, primary string) error {
 		return err
 	}
 	return serve(ctx, listener, "", primary, "")
+}
+
+// ListenAndServeCluster는 한 샤드의 투표자와 클라이언트용 요청 라우터를 시작한다.
+func ListenAndServeCluster(ctx context.Context, addr, configPath, dir string) (err error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	node, err := cluster.Open(ctx, addr, configPath, dir)
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	defer func() { err = errors.Join(err, node.Close()) }()
+	return serveConnections(ctx, listener, node, nil)
 }
 
 // Serve는 주어진 리스너를 사용해 메모리 전용 서버를 실행한다.
@@ -81,16 +97,34 @@ func serve(ctx context.Context, listener net.Listener, path, primary, fsync stri
 		}
 		executor = engine.NewWithStore(ctx, db, journal)
 	}
-	wg.Go(func() {
-		<-ctx.Done()
-		listener.Close() // Accept의 대기를 해제한다.
-	})
 	defer func() {
-		// 먼저 연결을 깨우고, 연결 고루틴과 실행기가 끝나기를 기다린다.
-		// 앞에서 등록한 aof.Close는 defer의 역순 실행에 따라 그 뒤에 호출된다.
 		cancel()
 		wg.Wait()
 		executor.Wait()
+	}()
+	var source *engine.Engine
+	if primary == "" {
+		source = executor
+	}
+	return serveConnections(ctx, listener, executor, source)
+}
+
+type commandExecutor interface {
+	Execute(resp.Value) (resp.Value, bool)
+}
+
+// standalone과 cluster가 연결별 RESP 읽기·쓰기 및 종료 순서를 공유한다.
+// source가 있는 standalone primary만 GOREDIS.SYNC 스트림을 열 수 있다.
+func serveConnections(ctx context.Context, listener net.Listener, executor commandExecutor, source *engine.Engine) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		<-ctx.Done()
+		listener.Close()
+	})
+	defer func() {
+		cancel()
+		wg.Wait()
 	}()
 
 	log.Printf("GoRedis listening on %s", listener.Addr())
@@ -104,11 +138,11 @@ func serve(ctx context.Context, listener net.Listener, path, primary, fsync stri
 		}
 		// Accept 루프는 이 연결의 요청을 기다리지 않고 다음 접속을 받는다.
 		// 각 연결 고루틴은 같은 executor를 사용하므로 모든 연결이 키 공간을 공유한다.
-		wg.Go(func() { handleConn(ctx, conn, executor, primary == "") })
+		wg.Go(func() { handleConn(ctx, conn, executor, source) })
 	}
 }
 
-func handleConn(ctx context.Context, conn net.Conn, executor *engine.Engine, isPrimary bool) {
+func handleConn(ctx context.Context, conn net.Conn, executor commandExecutor, source *engine.Engine) {
 	defer conn.Close()
 	// 서버 종료 때 소켓을 닫으면 ReadValue나 Flush에서 대기 중인 연결도 깨어난다.
 	// 연결이 먼저 끝나면 stop으로 종료 콜백을 해제한다.
@@ -133,8 +167,8 @@ func handleConn(ctx context.Context, conn net.Conn, executor *engine.Engine, isP
 		if command.Kind == resp.Array && len(command.Elements) == 1 {
 			name := command.Elements[0]
 			if name.Kind == resp.BulkString && bytes.EqualFold(name.Bytes, []byte(replica.SyncCommand)) {
-				if isPrimary {
-					replica.Stream(ctx, conn, executor)
+				if source != nil {
+					replica.Stream(ctx, conn, source)
 				} else {
 					writeReply(writer, resp.Value{Kind: resp.SimpleError, Bytes: []byte("ERR replication source must be a primary")})
 				}
