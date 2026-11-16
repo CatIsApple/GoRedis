@@ -2,14 +2,17 @@ package engine
 
 import (
 	"bytes"
+	"errors"
+	"log"
 	"strconv"
 
+	"github.com/CatIsApple/GoRedis/internal/persist"
 	"github.com/CatIsApple/GoRedis/internal/resp"
 )
 
 // execute는 연결이 해석한 RESP 배열에서 첫 원소를 명령 이름으로, 나머지를 인자로 읽는다.
 // 명령 형식과 인자 수를 확인한 뒤에만 키 공간이나 AOF를 변경한다.
-func (s *state) execute(command resp.Value) resp.Value {
+func (s *state) execute(command resp.Value, now int64) resp.Value {
 	args := command.Elements
 	if command.Kind != resp.Array || len(args) == 0 {
 		return commandError("ERR expected a non-empty command array")
@@ -21,14 +24,6 @@ func (s *state) execute(command resp.Value) resp.Value {
 	}
 
 	name := args[0].Bytes
-	if s.follower {
-		switch {
-		case commandIs(name, "SET"), commandIs(name, "EXPIRE"):
-			return commandError("READONLY You can't write against a read only replica")
-		case s.db == nil && (commandIs(name, "GET") || commandIs(name, "TTL")):
-			return commandError("LOADING Replica is waiting for its initial snapshot")
-		}
-	}
 	switch {
 	case commandIs(name, "PING"):
 		if len(args) == 2 {
@@ -38,41 +33,131 @@ func (s *state) execute(command resp.Value) resp.Value {
 			return wrongArity("ping")
 		}
 		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("PONG")}
+	case commandIs(name, "BGREWRITEAOF"):
+		if len(args) != 1 {
+			return wrongArity("bgrewriteaof")
+		}
+		if s.rewriter == nil {
+			return commandError("ERR AOF persistence is disabled")
+		}
+		if err := s.rewriter.Rewrite(s.db); err != nil {
+			if errors.Is(err, persist.ErrRewriteInProgress) {
+				return commandError("ERR Background append only file rewriting already in progress")
+			}
+			log.Printf("BGREWRITEAOF: %v", err)
+			return commandError("ERR Can't execute an AOF background rewriting. Please check the server logs for more information.")
+		}
+		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("Background append only file rewriting started")}
 	case commandIs(name, "SET"):
-		if len(args) != 3 {
+		if len(args) < 3 {
 			return wrongArity("set")
 		}
-		key, value := string(args[1].Bytes), string(args[2].Bytes)
-		// 로그 기록이 실패하면 기존 값과 TTL을 보존하고 이 요청에는 오류를 돌려준다.
-		if s.journal != nil && s.journal.AppendSet(key, value) != nil {
-			return commandError("MISCONF failed to persist write to AOF")
+		if s.follower {
+			return commandError(readOnlyError)
 		}
-		s.db.Set(key, value)
-		s.publish(key)
-		return resp.Value{Kind: resp.SimpleString, Bytes: []byte("OK")}
+		return s.set(args, now)
+	case commandIs(name, "MSET"):
+		if len(args) < 3 {
+			return wrongArity("mset")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		// Redis는 최소 인자 수와 쓰기 권한을 확인한 뒤 키·값 쌍이 맞는지 검사한다.
+		if len(args)%2 == 0 {
+			return wrongArity("mset")
+		}
+		return s.mset(args[1:])
+	case commandIs(name, "HSET"):
+		if len(args) < 4 {
+			return wrongArity("hset")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		if len(args)%2 != 0 {
+			return wrongArity("hset")
+		}
+		return s.hset(string(args[1].Bytes), args[2:], now)
+	case commandIs(name, "INCR"):
+		if len(args) != 2 {
+			return wrongArity("incr")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		return s.incr(string(args[1].Bytes), now)
+	case commandIs(name, "DEL"):
+		if len(args) < 2 {
+			return wrongArity("del")
+		}
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		return s.del(args[1:], now)
+	case commandIs(name, "EXISTS"):
+		if len(args) < 2 {
+			return wrongArity("exists")
+		}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		// EXISTS a a는 살아 있는 a를 두 번 센다. 모든 인자는 같은 시점으로 조회한다.
+		var count int64
+		for _, arg := range args[1:] {
+			if s.db.ExistsAt(string(arg.Bytes), now) {
+				count++
+			}
+		}
+		return resp.Value{Kind: resp.Integer, Int: count}
 	case commandIs(name, "GET"):
 		if len(args) != 2 {
 			return wrongArity("get")
 		}
-		value, found := s.db.Get(string(args[1].Bytes))
-		// 없는 키는 Bytes가 nil인 bulk string($-1), 저장된 빈 문자열은 길이 0인 bulk string($0)이다.
-		if !found {
-			return resp.Value{Kind: resp.BulkString}
+		if s.db == nil {
+			return commandError(loadingError)
 		}
-		return resp.Value{Kind: resp.BulkString, Bytes: []byte(value)}
+		return checkedBulkReply(s.db.StringAt(string(args[1].Bytes), now))
+	case commandIs(name, "HGET"):
+		if len(args) != 3 {
+			return wrongArity("hget")
+		}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		return checkedBulkReply(s.db.HGetAt(string(args[1].Bytes), string(args[2].Bytes), now))
+	case commandIs(name, "MGET"):
+		if len(args) < 2 {
+			return wrongArity("mget")
+		}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		return s.mget(args[1:], now)
+	case commandIs(name, "TYPE"):
+		if len(args) != 2 {
+			return wrongArity("type")
+		}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		kind := s.db.TypeAt(string(args[1].Bytes), now)
+		return resp.Value{Kind: resp.SimpleString, Bytes: []byte(kind)}
 	case commandIs(name, "EXPIRE"):
 		if len(args) != 3 {
 			return wrongArity("expire")
 		}
-		raw := string(args[2].Bytes)
-		seconds, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || strconv.FormatInt(seconds, 10) != raw {
-			return commandError("ERR value is not an integer or out of range")
+		if s.follower {
+			return commandError(readOnlyError)
+		}
+		seconds, ok := parseInt(string(args[2].Bytes))
+		if !ok {
+			return commandError(integerError)
 		}
 		key := string(args[1].Bytes)
 		// 10초 뒤 만료되는 키를 3초 후 복구하면 약 7초가 남아야 한다.
 		// 여기서 한 번 계산한 절대 시각을 디스크와 메모리 양쪽에 똑같이 적용한다.
-		deadline, found, err := s.db.PrepareExpiry(key, seconds)
+		deadline, found, err := s.db.PrepareExpiryAt(key, seconds, now)
 		if err != nil {
 			return commandError("ERR invalid expire time in 'expire' command")
 		}
@@ -80,7 +165,7 @@ func (s *state) execute(command resp.Value) resp.Value {
 			return resp.Value{Kind: resp.Integer, Int: 0}
 		}
 		if s.journal != nil && s.journal.AppendExpireAt(key, deadline) != nil {
-			return commandError("MISCONF failed to persist write to AOF")
+			return commandError(journalError)
 		}
 		s.db.SetExpiryAt(key, deadline)
 		s.publish(key)
@@ -89,10 +174,56 @@ func (s *state) execute(command resp.Value) resp.Value {
 		if len(args) != 2 {
 			return wrongArity("ttl")
 		}
-		return resp.Value{Kind: resp.Integer, Int: s.db.TTL(string(args[1].Bytes))}
+		if s.db == nil {
+			return commandError(loadingError)
+		}
+		return resp.Value{Kind: resp.Integer, Int: s.db.TTLAt(string(args[1].Bytes), now)}
 	default:
 		return commandError("ERR unknown command")
 	}
+}
+
+const (
+	readOnlyError = "READONLY You can't write against a read only replica."
+	loadingError  = "LOADING Replica is waiting for its initial snapshot"
+	integerError  = "ERR value is not an integer or out of range"
+	journalError  = "MISCONF failed to persist write to AOF"
+)
+
+// DEL은 존재하는 서로 다른 키만 기록하고 센다. 먼저 삭제 대상을 정하면 AOF
+// 기록에 실패해도 아직 메모리를 바꾸지 않았으므로 한 명령 전체가 적용되지 않는다.
+func (s *state) del(args []resp.Value, now int64) resp.Value {
+	seen := make(map[string]struct{})
+	var keys []string
+	for _, arg := range args {
+		key := string(arg.Bytes)
+		if _, duplicate := seen[key]; duplicate || !s.db.ExistsAt(key, now) {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(keys) > 0 {
+		if s.journal != nil && s.journal.AppendDel(keys) != nil {
+			return commandError(journalError)
+		}
+		for _, key := range keys {
+			s.db.Delete(key)
+		}
+		s.publishDeleted(keys)
+	}
+	return resp.Value{Kind: resp.Integer, Int: int64(len(keys))}
+}
+
+// Redis 정수 인자는 부호 +, 선행 0, -0을 허용하지 않는다.
+func parseInt(text string) (int64, bool) {
+	// 가장 긴 int64 표기는 -9223372036854775808이다. 긴 문자열 값에 INCR을
+	// 보내도 문자열 전체를 숫자로 변환하려고 하지 않는다.
+	if len(text) > len("-9223372036854775808") {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(text, 10, 64)
+	return n, err == nil && strconv.FormatInt(n, 10) == text
 }
 
 // 명령 이름은 ASCII에서만 대소문자를 구분하지 않는다.
