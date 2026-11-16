@@ -30,20 +30,37 @@ func (s *Store) Get(key string) (string, bool) {
 
 // Expire는 키의 만료 시간을 갱신한다. 0초 이하이면 키를 바로 삭제한다.
 func (s *Store) Expire(key string, seconds int64) (bool, error) {
+	deadline, found, err := s.PrepareExpiry(key, seconds)
+	if found {
+		s.SetExpiryAt(key, deadline)
+	}
+	return found, err
+}
+
+// PrepareExpiry는 명령 시점에 키가 존재하는지와 기록할 절대 만료 시각을 계산한다.
+// 0은 즉시 삭제를 뜻한다. 계산된 시각은 AOF와 실제 키 공간에 함께 사용한다.
+func (s *Store) PrepareExpiry(key string, seconds int64) (int64, bool, error) {
 	now := time.Now().UnixMilli()
 	if seconds < math.MinInt64/1000 || seconds > math.MaxInt64/1000 || (seconds > 0 && now > math.MaxInt64-seconds*1000) {
-		return false, errors.New("expiration time out of range")
+		return 0, false, errors.New("expiration time out of range")
 	}
 	_, found := s.lookup(key, now)
-	if !found {
-		return false, nil
+	if !found || seconds <= 0 {
+		return 0, found, nil
 	}
-	if seconds <= 0 {
+	return now + seconds*1000, true, nil
+}
+
+// SetExpiryAt은 키에 Unix 밀리초 만료 시각을 적용한다. AOF를 재생할 때
+// 뒤에 오는 EXPIRE가 기한을 연장할 수 있으므로 현재 시각과는 비교하지 않는다.
+func (s *Store) SetExpiryAt(key string, deadline int64) {
+	if deadline <= 0 {
 		s.remove(key)
-	} else {
-		s.deadlines[key] = now + seconds*1000
+		return
 	}
-	return true, nil
+	if _, found := s.values[key]; found {
+		s.deadlines[key] = deadline
+	}
 }
 
 // TTL은 남은 초를 반올림해 반환한다. 키가 없으면 -2, 만료 설정이 없으면 -1이다.
