@@ -1,17 +1,24 @@
 package engine
 
-import "github.com/CatIsApple/GoRedis/internal/store"
+import (
+	"github.com/CatIsApple/GoRedis/internal/store"
+)
+
+// Change는 primary에서 실행을 마친 한 키의 변경을 담는다.
+type Change struct {
+	Entry store.Entry
+}
 
 // Subscribe는 같은 실행 차례에 스냅샷을 만들고 구독을 등록한다. 스냅샷을
 // 네트워크로 전송하는 사이 적용된 쓰기는 이 채널에 실행 순서대로 쌓인다.
-func (e *Engine) Subscribe() (snapshot []store.Entry, changes <-chan store.Entry, unsubscribe func(), ok bool) {
-	var ch chan store.Entry
+func (e *Engine) Subscribe() (snapshot []store.Entry, changes <-chan Change, unsubscribe func(), ok bool) {
+	var ch chan Change
 	e.call(func(s *state) {
 		if s.follower {
 			return
 		}
 		snapshot = s.db.Entries()
-		ch = make(chan store.Entry, 256)
+		ch = make(chan Change, 256)
 		s.subscribers[ch] = struct{}{}
 	})
 	if ch == nil {
@@ -33,10 +40,13 @@ func (s *state) publish(key string) {
 	}
 	// EXPIRE도 값과 기한을 함께 보낸다. 복제본에서 이전 기한이 먼저 지났어도
 	// 뒤늦게 도착한 연장 통지로 primary의 최신 값을 복원할 수 있다.
-	entry := s.db.Entry(key)
+	s.broadcast(Change{Entry: s.db.Entry(key)})
+}
+
+func (s *state) broadcast(change Change) {
 	for ch := range s.subscribers {
 		select {
-		case ch <- entry:
+		case ch <- change:
 		default:
 			// 느린 연결 때문에 명령 실행이 막히면 모든 클라이언트가 영향을 받는다.
 			// 한 건이라도 빠지면 이 스트림을 닫아 복제본이 전체 동기화부터 다시 시작하게 한다.
@@ -58,13 +68,14 @@ func (e *Engine) ReplaceReplica(db *store.Store) (applied bool) {
 	return applied
 }
 
-// ApplyReplica는 외부 클라이언트의 쓰기 명령과 구분해 복제 스트림의 변경을 적용한다.
-func (e *Engine) ApplyReplica(entry store.Entry) (applied bool) {
+// ApplyReplica는 연결에서 받은 변경을 복제본의 실행기로 보낸다.
+func (e *Engine) ApplyReplica(change Change) (applied bool) {
 	e.call(func(s *state) {
-		if s.follower && s.db != nil {
-			s.db.ApplyEntry(entry)
-			applied = true
+		if !s.follower || s.db == nil {
+			return
 		}
+		s.db.ApplyEntry(change.Entry)
+		applied = true
 	})
 	return applied
 }

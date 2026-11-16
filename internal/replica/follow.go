@@ -91,7 +91,7 @@ func receive(conn net.Conn, executor *engine.Engine) error {
 				return errors.New("replication stream: deletion inside snapshot")
 			}
 			staging.ApplyEntry(entry)
-		} else if !executor.ApplyReplica(entry) {
+		} else if !executor.ApplyReplica(engine.Change{Entry: entry}) {
 			return errors.New("replica executor unavailable")
 		}
 	}

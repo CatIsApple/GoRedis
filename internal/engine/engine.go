@@ -27,7 +27,7 @@ type state struct {
 	db          *store.Store
 	journal     Journal
 	follower    bool
-	subscribers map[chan store.Entry]struct{}
+	subscribers map[chan Change]struct{}
 }
 
 func New(ctx context.Context) *Engine {
@@ -36,7 +36,7 @@ func New(ctx context.Context) *Engine {
 
 // NewWithStore는 시작 시 준비한 키 공간의 소유권을 primary 실행 고루틴에 넘긴다.
 func NewWithStore(ctx context.Context, db *store.Store, journal Journal) *Engine {
-	return start(ctx, &state{db: db, journal: journal, subscribers: make(map[chan store.Entry]struct{})})
+	return start(ctx, &state{db: db, journal: journal, subscribers: make(map[chan Change]struct{})})
 }
 
 // NewFollower는 첫 전체 동기화를 기다리는 읽기 전용 실행기를 만든다.

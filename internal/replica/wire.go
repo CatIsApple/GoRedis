@@ -28,7 +28,7 @@ func isMarker(frame resp.Value, name string) bool {
 	return frame.Kind == resp.SimpleString && string(frame.Bytes) == name
 }
 
-// 각 변경은 해당 키의 최종 상태를 담는다. 세 번째 원소는 절대 만료 시각(ms)이며,
+// 문자열과 삭제는 기존 세 원소 프레임으로 보낸다. 세 번째 원소는 절대 만료 시각(ms)이며,
 // 0은 영구 키다. 삭제는 null 값으로 인코딩해 길이 0인 실제 값과 구별한다.
 func entryFrame(entry store.Entry) resp.Value {
 	value := resp.Value{Kind: resp.BulkString}
@@ -54,11 +54,15 @@ func parseEntry(frame resp.Value) (store.Entry, error) {
 	return store.Entry{Key: string(key.Bytes), Value: string(value.Bytes), ExpiresAt: expiry.Int, Deleted: value.Bytes == nil}, nil
 }
 
-func writeFrame(conn net.Conn, w *resp.Writer, frame resp.Value) error {
+func bufferFrame(conn net.Conn, w *resp.Writer, frame resp.Value) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(frameTimeout)); err != nil {
 		return err
 	}
-	if err := w.WriteValue(frame); err != nil {
+	return w.WriteValue(frame)
+}
+
+func writeFrame(conn net.Conn, w *resp.Writer, frame resp.Value) error {
+	if err := bufferFrame(conn, w, frame); err != nil {
 		return err
 	}
 	return w.Flush()
