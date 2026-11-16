@@ -7,7 +7,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/CatIsApple/GoRedis/internal/store"
 )
+
+var ErrRewriteInProgress = errors.New("background append only file rewriting already in progress")
 
 // rotateIncrement은 새 INCR을 만든 뒤, 아직은 이전 base와 모든 INCR이 필요한
 // manifest를 먼저 공개한다. 이 시점에 죽어도 이전 base부터 새 쓰기까지 모두 재생된다.
@@ -56,6 +61,87 @@ func (a *AOF) rotateIncrement() error {
 	return err
 }
 
+// Rewrite는 단일 실행기 안에서 새 INCR로 전환하고 같은 시점의 키 공간을 캡처한다.
+// 이후 디스크 인코딩과 manifest 교체에는 store 접근이 없어 요청 처리를 재개할 수 있다.
+func (a *AOF) Rewrite(db *store.Store) error {
+	a.mu.Lock()
+	if a.done != nil {
+		a.mu.Unlock()
+		return ErrRewriteInProgress
+	}
+	if a.failed != nil {
+		a.mu.Unlock()
+		return a.failed
+	}
+	if err := a.rotateIncrement(); err != nil {
+		a.retryAfter = time.Now().Add(time.Minute)
+		a.mu.Unlock()
+		return err
+	}
+	entries := db.Entries()
+	current := a.active
+	a.done = make(chan struct{})
+	a.mu.Unlock()
+
+	go func() {
+		err := a.writeGeneration(entries, current)
+		a.mu.Lock()
+		if err != nil {
+			a.retryAfter = time.Now().Add(time.Minute)
+			log.Printf("AOF background rewrite: %v", err)
+		}
+		close(a.done)
+		a.done = nil
+		a.mu.Unlock()
+	}()
+	return nil
+}
+
+func (a *AOF) writeGeneration(entries []store.Entry, previous manifest) error {
+	base, size, err := a.writeBase(entries, previous.base.seq)
+	if err != nil {
+		return err
+	}
+	tail := previous.tails[len(previous.tails)-1]
+	next := manifest{base: base, tails: []part{tail}}
+	if err := syncDir(a.dir); err != nil {
+		os.Remove(filepath.Join(a.dir, base.name))
+		return err
+	}
+	published, err := installManifest(a.manifestPath, next)
+	if !published {
+		os.Remove(filepath.Join(a.dir, base.name))
+		return err
+	}
+	// background 쓰기 중 추가된 INCR까지 현재 크기 기준에 포함한다.
+	// next와 previous 모두 동일한 마지막 INCR을 재생하므로 이후 쓰기는 안전하다.
+	total := size
+	if info, statErr := os.Stat(filepath.Join(a.dir, tail.name)); statErr == nil {
+		total += info.Size()
+	}
+	a.mu.Lock()
+	a.active, a.fixedSize, a.rewriteSize = next, size, total
+	a.mu.Unlock()
+	if err == nil {
+		a.cleanObsolete(next, previous)
+	}
+	return err
+}
+
+// ShouldRewrite는 Redis 기본 기준(64 MiB 초과, 마지막 기준 크기에서 100% 이상 증가)을
+// 적용한다. 각 쓰기의 바이트 수를 이미 세어 두므로 타이머에서 파일을 다시 열지 않는다.
+func (a *AOF) ShouldRewrite() bool {
+	if !a.mu.TryLock() {
+		return false
+	}
+	defer a.mu.Unlock()
+	if a.done != nil || a.failed != nil || time.Now().Before(a.retryAfter) {
+		return false
+	}
+	size := a.fixedSize + a.currentSize
+	return size > 64<<20 && size-a.rewriteSize >= a.rewriteSize
+}
+
 func (a *AOF) cleanObsolete(m, previous manifest) {
 	files, err := os.ReadDir(a.dir)
 	if err != nil {
@@ -98,7 +184,15 @@ func (a *AOF) cleanObsolete(m, previous manifest) {
 	}
 }
 
+// Close는 실행기가 멈춘 뒤 호출한다. 백그라운드 작성기가 manifest를 교체하고
+// 마지막 INCR이 동기화된 다음에만 다른 서버가 같은 디렉터리를 열 수 있다.
 func (a *AOF) Close() error {
+	a.mu.Lock()
+	done := a.done
+	a.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 	a.stopFsync()
 	return errors.Join(a.syncFile(a.file), a.file.Close(), a.lock.Close())
 }

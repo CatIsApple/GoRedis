@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/CatIsApple/GoRedis/internal/resp"
 	"github.com/CatIsApple/GoRedis/internal/store"
@@ -16,12 +18,16 @@ import (
 
 const initMarker = ".goredis-initializing"
 
-// generations는 복구할 파일 목록과 현재 증분 파일을 가리킨다.
+// file과 writer는 명령 실행기만 교체한다. mu는 백그라운드 RDB 작성기와 공유하는
+// manifest 및 크기 기준을 보호한다. 진행 중에는 done이 닫힐 때까지 다음 재작성을 막는다.
 type generations struct {
 	dir, prefix, manifestPath string
 	lock                      *os.File
+	mu                        sync.Mutex
 	active                    manifest
+	done                      chan struct{}
 	fixedSize, rewriteSize    int64
+	retryAfter                time.Time
 	currentSize               int64 // 활성 INCR에 실제로 기록한 크기. 실행기만 갱신한다.
 }
 
