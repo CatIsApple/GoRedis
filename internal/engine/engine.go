@@ -89,7 +89,7 @@ func (e *Engine) call(work func(*state)) bool {
 
 // Execute는 명령의 응답을 기다린다. 실행기가 종료됐으면 ok는 false다.
 func (e *Engine) Execute(command resp.Value) (reply resp.Value, ok bool) {
-	ok = e.call(func(s *state) { reply = s.execute(command) })
+	ok = e.call(func(s *state) { reply = s.execute(command, time.Now().UnixMilli()) })
 	return reply, ok
 }
 
