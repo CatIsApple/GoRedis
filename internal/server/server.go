@@ -18,11 +18,16 @@ import (
 
 // ListenAndServe는 addr에 TCP 리스너를 열고 클라이언트 연결을 받는다.
 func ListenAndServe(ctx context.Context, addr, aofPath string) error {
+	return ListenAndServeWithFsync(ctx, addr, aofPath, "everysec")
+}
+
+// ListenAndServeWithFsync는 증분 AOF의 디스크 동기화 정책을 지정해 시작한다.
+func ListenAndServeWithFsync(ctx context.Context, addr, aofPath, fsync string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	return ServeWithAOF(ctx, listener, aofPath)
+	return serve(ctx, listener, aofPath, "", fsync)
 }
 
 // ListenAndServeReplica는 클라이언트 읽기용 포트를 열고 지정된 primary를 따라간다.
@@ -34,7 +39,7 @@ func ListenAndServeReplica(ctx context.Context, addr, primary string) error {
 	if err != nil {
 		return err
 	}
-	return serve(ctx, listener, "", primary)
+	return serve(ctx, listener, "", primary, "")
 }
 
 // Serve는 주어진 리스너를 사용해 메모리 전용 서버를 실행한다.
@@ -45,10 +50,10 @@ func Serve(ctx context.Context, listener net.Listener) error {
 
 // ServeWithAOF는 복구를 마친 뒤 요청을 받는다. 빈 경로면 메모리에서만 실행한다.
 func ServeWithAOF(ctx context.Context, listener net.Listener, path string) error {
-	return serve(ctx, listener, path, "")
+	return serve(ctx, listener, path, "", "everysec")
 }
 
-func serve(ctx context.Context, listener net.Listener, path, primary string) (err error) {
+func serve(ctx context.Context, listener net.Listener, path, primary, fsync string) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var executor *engine.Engine
@@ -60,9 +65,9 @@ func serve(ctx context.Context, listener net.Listener, path, primary string) (er
 		db := store.New()
 		var journal engine.Journal
 		if path != "" {
-			// 같은 db에 AOF를 처음부터 재생한다. 복구가 끝나야 아래 Accept 루프에
-			// 진입하므로 클라이언트가 복구 중인 키 공간을 읽을 수 없다.
-			aof, err := persist.Open(path, db)
+			// RDB를 읽고 manifest가 가리키는 증분 AOF를 순서대로 적용한다.
+			// 복구가 끝난 뒤 요청을 받으므로 클라이언트는 중간 상태를 볼 수 없다.
+			aof, err := persist.OpenWithFsync(path, db, fsync)
 			if err != nil {
 				listener.Close()
 				return err
