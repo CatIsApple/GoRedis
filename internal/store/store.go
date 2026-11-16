@@ -6,26 +6,69 @@ import (
 	"time"
 )
 
-// Store는 단일 실행기가 소유하는 인메모리 키 공간이다.
-// 키와 값은 임의의 바이트를 보존하는 Go 문자열로 저장한다.
+// Store는 단일 실행기가 소유하는 인메모리 키 공간이다. 한 키는 문자열이나
+// 해시 한 개를 가리킨다. 키, 필드명, 문자열 값에는 임의의 바이트가 들어갈 수 있다.
 // deadlines에는 기한이 있는 키만 넣으므로 만료 정리는 이 맵만 순회한다.
 type Store struct {
-	values    map[string]string
+	values    map[string]storedValue
 	deadlines map[string]int64 // 만료가 설정된 키의 Unix 밀리초
 }
 
+// fields가 nil이면 문자열이다. 따라서 길이가 0인 문자열도 해시와 구분된다.
+type storedValue struct {
+	text   string
+	fields map[string]string
+}
+
+// Pair는 MSET의 키·값 또는 HSET의 필드·값 한 쌍이다. 명령 인자 순서로 적용한다.
+type Pair struct {
+	Key   string
+	Value string
+}
+
 func New() *Store {
-	return &Store{values: make(map[string]string), deadlines: make(map[string]int64)}
+	return &Store{values: make(map[string]storedValue), deadlines: make(map[string]int64)}
 }
 
 func (s *Store) Set(key, value string) {
-	s.values[key] = value
+	s.values[key] = storedValue{text: value}
 	// 덮어쓴 값이 예전 값의 만료 시각에 함께 사라지지 않도록 기한도 지운다.
 	delete(s.deadlines, key)
 }
 
+// SetMany는 각 키를 입력 순서대로 덮어쓰고 그 키의 기존 TTL을 해제한다.
+func (s *Store) SetMany(pairs []Pair) {
+	for _, pair := range pairs {
+		s.Set(pair.Key, pair.Value)
+	}
+}
+
 func (s *Store) Get(key string) (string, bool) {
-	return s.lookup(key, time.Now().UnixMilli())
+	return s.GetAt(key, time.Now().UnixMilli())
+}
+
+// ExistsAt은 만료된 키를 없는 것으로 센다. 여러 키를 읽는 명령은 동일한 now를
+// 전달해, 반복된 키의 기한이 순회 도중 지나도 한 시점의 결과를 돌려준다.
+func (s *Store) ExistsAt(key string, now int64) bool {
+	_, found := s.lookup(key, now)
+	return found
+}
+
+// TypeAt은 명령을 시작한 시각에 키가 살아 있는지 확인하고 Redis 자료형 이름을 돌려준다.
+func (s *Store) TypeAt(key string, now int64) string {
+	v, found := s.lookup(key, now)
+	if !found {
+		return "none"
+	}
+	if v.fields != nil {
+		return "hash"
+	}
+	return "string"
+}
+
+// ExpiresAt은 저장된 절대 만료 시각(ms)을 반환한다. 만료 설정이 없으면 0이다.
+func (s *Store) ExpiresAt(key string) int64 {
+	return s.deadlines[key]
 }
 
 // Expire는 키의 만료 시간을 갱신한다. 0초 이하이면 키를 바로 삭제한다.
@@ -40,22 +83,34 @@ func (s *Store) Expire(key string, seconds int64) (bool, error) {
 // PrepareExpiry는 명령 시점에 키가 존재하는지와 기록할 절대 만료 시각을 계산한다.
 // 0은 즉시 삭제를 뜻한다. 계산된 시각은 AOF와 실제 키 공간에 함께 사용한다.
 func (s *Store) PrepareExpiry(key string, seconds int64) (int64, bool, error) {
-	now := time.Now().UnixMilli()
+	return s.PrepareExpiryAt(key, seconds, time.Now().UnixMilli())
+}
+
+func (s *Store) PrepareExpiryAt(key string, seconds, now int64) (int64, bool, error) {
+	deadline, err := ExpiryDeadline(now, seconds)
+	if err != nil || !s.ExistsAt(key, now) {
+		return 0, false, err
+	}
+	return deadline, true, nil
+}
+
+// ExpiryDeadline은 EXPIRE와 SET EX에 공통으로 쓰는 절대 만료 시각을 계산한다.
+// 곱셈과 덧셈 전에 범위를 확인해 아주 큰 초 값이 과거 시각으로 바뀌는 일을 막는다.
+func ExpiryDeadline(now, seconds int64) (int64, error) {
 	if seconds < math.MinInt64/1000 || seconds > math.MaxInt64/1000 || (seconds > 0 && now > math.MaxInt64-seconds*1000) {
-		return 0, false, errors.New("expiration time out of range")
+		return 0, errors.New("expiration time out of range")
 	}
-	_, found := s.lookup(key, now)
-	if !found || seconds <= 0 {
-		return 0, found, nil
+	if seconds <= 0 {
+		return 0, nil
 	}
-	return now + seconds*1000, true, nil
+	return now + seconds*1000, nil
 }
 
 // SetExpiryAt은 키에 Unix 밀리초 만료 시각을 적용한다. AOF를 재생할 때
 // 뒤에 오는 EXPIRE가 기한을 연장할 수 있으므로 현재 시각과는 비교하지 않는다.
 func (s *Store) SetExpiryAt(key string, deadline int64) {
 	if deadline <= 0 {
-		s.remove(key)
+		s.Delete(key)
 		return
 	}
 	if _, found := s.values[key]; found {
@@ -65,9 +120,11 @@ func (s *Store) SetExpiryAt(key string, deadline int64) {
 
 // TTL은 남은 초를 반올림해 반환한다. 키가 없으면 -2, 만료 설정이 없으면 -1이다.
 func (s *Store) TTL(key string) int64 {
-	now := time.Now().UnixMilli()
-	_, found := s.lookup(key, now)
-	if !found {
+	return s.TTLAt(key, time.Now().UnixMilli())
+}
+
+func (s *Store) TTLAt(key string, now int64) int64 {
+	if !s.ExistsAt(key, now) {
 		return -2
 	}
 	deadline, expires := s.deadlines[key]
@@ -88,23 +145,39 @@ func (s *Store) PurgeExpired(limit int) {
 			break
 		}
 		if deadline <= now {
-			s.remove(key)
+			s.Delete(key)
 		}
 		limit--
 	}
 }
 
-func (s *Store) lookup(key string, now int64) (string, bool) {
+// GetAt은 지정한 시각의 문자열을 조회한다. MGET은 해시와 없는 키에 모두 null을 반환한다.
+func (s *Store) GetAt(key string, now int64) (string, bool) {
+	v, found, _ := s.StringAt(key, now)
+	return v, found
+}
+
+// StringAt은 GET과 INCR에서 문자열 키를 읽는다. 해시는 명령을 실행하기 전에 타입 오류를 반환한다.
+func (s *Store) StringAt(key string, now int64) (string, bool, error) {
+	v, found := s.lookup(key, now)
+	if v.fields != nil {
+		return "", false, ErrWrongType
+	}
+	return v.text, found, nil
+}
+
+func (s *Store) lookup(key string, now int64) (storedValue, bool) {
 	// 주기적인 정리가 아직 이 키에 도달하지 않았어도, 지금 만료됐다면 이 조회에서 바로 제거한다.
 	if deadline, expires := s.deadlines[key]; expires && deadline <= now {
-		s.remove(key)
-		return "", false
+		s.Delete(key)
+		return storedValue{}, false
 	}
 	value, found := s.values[key]
 	return value, found
 }
 
-func (s *Store) remove(key string) {
+// Delete는 값과 만료 정보를 함께 제거한다. AOF 재생에서도 삭제 당시의 결과를 그대로 적용한다.
+func (s *Store) Delete(key string) {
 	delete(s.values, key)
 	delete(s.deadlines, key)
 }
