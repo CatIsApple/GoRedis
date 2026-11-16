@@ -17,12 +17,31 @@ func main() {
 	aofPath := flag.String("aof", "appendonly.aof", "persistence path for RDB and incremental AOF (empty for in-memory mode)")
 	fsync := flag.String("appendfsync", "everysec", "incremental AOF fsync policy: always, everysec or no")
 	primary := flag.String("replicaof", "", "follow this GoRedis primary (host:port) as a read-only replica")
+	clusterConfig := flag.String("cluster-config", "", "static JSON shard and voter configuration")
+	clusterDir := flag.String("cluster-dir", "", "persistent state for this cluster node (default: cluster-data/<node ID>)")
 	flag.Parse()
 
 	// Ctrl+C와 SIGTERM을 context 취소로 전달한다. 서버는 이 신호를 받아
 	// 리스너와 연결을 닫고 진행 중인 명령이 끝난 뒤 AOF 파일을 닫는다.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *clusterConfig != "" {
+		if *primary != "" {
+			log.Fatal("-cluster-config and -replicaof select different replication modes")
+		}
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "aof" || f.Name == "appendfsync" {
+				log.Fatal("cluster nodes persist Raft state in -cluster-dir; standalone AOF flags are incompatible")
+			}
+		})
+		if err := server.ListenAndServeCluster(ctx, *addr, *clusterConfig, *clusterDir); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if *clusterDir != "" {
+		log.Fatal("-cluster-dir requires -cluster-config")
+	}
 	if *primary != "" {
 		// replica는 시작할 때 primary의 스냅샷을 받는다. 같은 디렉터리에서 두 프로세스를
 		// 실행해도 replica가 primary의 기본 appendonly.aof를 열지 않도록 모드를 먼저 고른다.
