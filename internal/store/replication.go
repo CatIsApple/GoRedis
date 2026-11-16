@@ -3,10 +3,12 @@ package store
 import "time"
 
 // Entry는 한 키의 값과 만료 시각을 함께 담는다. ExpiresAt은 Unix 밀리초이며
-// 0이면 만료 설정이 없다. Deleted는 빈 문자열을 저장한 경우와 삭제를 구분한다.
+// 0이면 만료 설정이 없다. 해시는 Hash에 필드와 값을 담고 문자열은 Value에 담는다.
+// Deleted는 삭제와 빈 문자열을 구분한다.
 type Entry struct {
 	Key       string
 	Value     string
+	Hash      []Pair
 	ExpiresAt int64
 	Deleted   bool
 }
@@ -21,7 +23,15 @@ func (s *Store) entryAt(key string, now int64) Entry {
 	if !found {
 		return Entry{Key: key, Deleted: true}
 	}
-	return Entry{Key: key, Value: value, ExpiresAt: s.deadlines[key]}
+	entry := Entry{Key: key, Value: value.text, ExpiresAt: s.deadlines[key]}
+	if value.fields != nil {
+		// 복제 고루틴이 전송하는 동안 HSET이 원본 맵을 수정할 수 있어 필드 쌍을 복사한다.
+		entry.Hash = make([]Pair, 0, len(value.fields))
+		for field, v := range value.fields {
+			entry.Hash = append(entry.Hash, Pair{Key: field, Value: v})
+		}
+	}
+	return entry
 }
 
 // Entries는 한 시점에 살아 있는 키만 복사한다. 결과의 문자열은 불변이라
@@ -49,7 +59,13 @@ func (s *Store) ApplyEntry(entry Entry) {
 		s.Delete(entry.Key)
 		return
 	}
-	s.Set(entry.Key, entry.Value)
+	if entry.Hash != nil {
+		// 전체 해시를 받았으므로 이전 해시에만 남아 있는 필드와 TTL도 함께 교체한다.
+		s.Delete(entry.Key)
+		s.HSet(entry.Key, entry.Hash)
+	} else {
+		s.Set(entry.Key, entry.Value)
+	}
 	if entry.ExpiresAt != 0 {
 		s.SetExpiryAt(entry.Key, entry.ExpiresAt)
 	}
