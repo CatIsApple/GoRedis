@@ -18,8 +18,10 @@ import (
 const (
 	rdbHeader = "REDIS0011"
 
-	rdbString = 0
-	rdbHash   = 4
+	rdbString       = 0
+	rdbHash         = 4
+	rdbHashZiplist  = 13
+	rdbHashListpack = 16
 
 	rdbIdle      = 248
 	rdbFrequency = 249
@@ -180,7 +182,7 @@ func readRDB(src io.Reader, db *store.Store) error {
 		case rdbExpireSec:
 			deadline = int64(int32(binary.LittleEndian.Uint32(r.number(4)))) * 1000
 			expiring = true
-		case rdbString, rdbHash:
+		case rdbString, rdbHash, rdbHashZiplist, rdbHashListpack:
 			key := string(r.bytes())
 			if r.err != nil {
 				return r.err
@@ -224,7 +226,15 @@ func (r *rdbDecoder) loadValue(db *store.Store, key string, kind byte) {
 				r.err = errors.New("duplicate hash field in RDB")
 			}
 		}
-
+	case rdbHashZiplist, rdbHashListpack:
+		data := r.bytes()
+		if r.err == nil {
+			var fields []store.Pair
+			fields, r.err = decodePackedHash(data, kind == rdbHashListpack)
+			if r.err == nil {
+				db.HSet(key, fields)
+			}
+		}
 	}
 }
 
@@ -276,7 +286,7 @@ func (r *rdbDecoder) bytes() []byte {
 	if !encoded {
 		return r.payload(n)
 	}
-	// Redis는 십진 문자열을 부호 있는 정수로 저장할 수 있다.
+	// Redis는 십진 문자열을 부호 있는 정수로, 반복이 많은 값은 LZF로 줄여 저장할 수 있다.
 	var integer int64
 	switch n {
 	case 0:
@@ -285,6 +295,18 @@ func (r *rdbDecoder) bytes() []byte {
 		integer = int64(int16(binary.LittleEndian.Uint16(r.number(2))))
 	case 2:
 		integer = int64(int32(binary.LittleEndian.Uint32(r.number(4))))
+	case 3:
+		compressed, original := r.length(), r.length()
+		if original > rdbMaxString && r.err == nil {
+			r.err = errors.New("RDB uncompressed string exceeds size limit")
+		}
+		payload := r.payload(compressed)
+		if r.err != nil {
+			return nil
+		}
+		var data []byte
+		data, r.err = decodeLZF(payload, original)
+		return data
 	default:
 		r.err = fmt.Errorf("unsupported RDB string encoding %d", n)
 		return nil
