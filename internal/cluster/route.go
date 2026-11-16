@@ -4,6 +4,8 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -83,6 +85,8 @@ func (c *Cluster) route(args []string) resp.Value {
 	switch name {
 	case "GOREDIS.LEADER":
 		return c.leaderReply(args)
+	case "CLUSTER":
+		return c.clusterCommand(args)
 	case "PING":
 		switch len(args) {
 		case 1:
@@ -144,9 +148,80 @@ func (c *Cluster) redirect(slot int, owner string) resp.Value {
 	return routeError("MOVED " + strconv.Itoa(slot) + " " + owner)
 }
 
+func (c *Cluster) clusterCommand(args []string) resp.Value {
+	if len(args) < 2 {
+		return arityError("cluster")
+	}
+	sub := commandName(args[1])
+	switch sub {
+	case "KEYSLOT":
+		if len(args) != 3 {
+			return arityError("cluster|keyslot")
+		}
+		return integer(KeySlot(args[2]))
+	case "SLOTS":
+		if len(args) != 2 {
+			return arityError("cluster|slots")
+		}
+		return c.slots()
+	case "INFO":
+		if len(args) != 2 {
+			return arityError("cluster|info")
+		}
+		return c.info()
+	default:
+		return routeError("ERR unknown CLUSTER subcommand")
+	}
+}
+
+func (c *Cluster) slots() resp.Value {
+	shards := c.config.Shards
+	ranges := make([]resp.Value, 0, len(shards))
+	for i, shard := range shards {
+		owner := c.owner(i)
+		if owner == "" {
+			continue
+		}
+		row := []resp.Value{integer(firstSlot(i, len(shards))), integer(firstSlot(i+1, len(shards)) - 1), slotNode(owner)}
+		for _, node := range shard.Nodes {
+			if node.Addr != owner {
+				row = append(row, slotNode(node.Addr))
+			}
+		}
+		ranges = append(ranges, resp.Value{Kind: resp.Array, Elements: row})
+	}
+	return resp.Value{Kind: resp.Array, Elements: ranges}
+}
+
+// RESP2의 각 노드는 [호스트, 포트, 노드 ID]다. 토폴로지 검사 단계에서
+// 주소 형식을 이미 검증한다. 같은 주소의 ID는 프로세스 재시작 후에도 유지된다.
+func slotNode(addr string) resp.Value {
+	host, port, _ := net.SplitHostPort(addr)
+	number, _ := strconv.Atoi(port)
+	return resp.Value{Kind: resp.Array, Elements: []resp.Value{bulkString(host), integer(number), bulkString(nodeID(addr))}}
+}
+
 func nodeID(addr string) string {
 	id := sha1.Sum([]byte(addr))
 	return hex.EncodeToString(id[:])
+}
+
+func (c *Cluster) info() resp.Value {
+	shards := c.config.Shards
+	var healthySlots, knownNodes, activePrimaries int
+	for i, shard := range shards {
+		knownNodes += len(shard.Nodes)
+		if c.owner(i) != "" {
+			healthySlots += firstSlot(i+1, len(shards)) - firstSlot(i, len(shards))
+			activePrimaries++
+		}
+	}
+	state := "ok"
+	if healthySlots < slotCount {
+		state = "fail"
+	}
+	return bulkString(fmt.Sprintf("cluster_state:%s\r\ncluster_slots_assigned:%d\r\ncluster_slots_ok:%d\r\ncluster_slots_fail:%d\r\ncluster_known_nodes:%d\r\ncluster_size:%d\r\n",
+		state, slotCount, healthySlots, slotCount-healthySlots, knownNodes, activePrimaries))
 }
 
 func commandName(raw string) string {
@@ -159,6 +234,7 @@ func commandName(raw string) string {
 	return strings.ToUpper(raw)
 }
 
+func integer(n int) resp.Value       { return resp.Value{Kind: resp.Integer, Int: int64(n)} }
 func bulkString(s string) resp.Value { return resp.Value{Kind: resp.BulkString, Bytes: []byte(s)} }
 func routeError(s string) resp.Value { return resp.Value{Kind: resp.SimpleError, Bytes: []byte(s)} }
 func arityError(name string) resp.Value {
