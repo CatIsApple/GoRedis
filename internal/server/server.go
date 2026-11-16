@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"sync"
+
+	"github.com/CatIsApple/GoRedis/internal/resp"
 )
 
 // ListenAndServe는 addr에 TCP 리스너를 열고 클라이언트 연결을 받는다.
@@ -51,6 +54,28 @@ func handleConn(ctx context.Context, conn net.Conn) {
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
-	// RESP 처리를 추가하기 전까지는 입력을 읽고 버린다.
-	_, _ = io.Copy(io.Discard, conn)
+	// Reader가 다음 요청의 바이트까지 미리 읽을 수 있어 연결 내에서 계속 재사용한다.
+	reader := resp.NewReader(conn)
+	writer := resp.NewWriter(conn)
+	for {
+		_, err := reader.ReadValue()
+		if err != nil {
+			if errors.Is(err, resp.ErrProtocol) || errors.Is(err, io.ErrUnexpectedEOF) {
+				writeReply(writer, resp.Value{Kind: resp.SimpleError, Bytes: []byte("ERR Protocol error")})
+			}
+			return
+		}
+		// 다음 단계에서 단일 실행기에 요청을 전달한다.
+		reply := resp.Value{Kind: resp.SimpleError, Bytes: []byte("ERR command execution not implemented")}
+		if writeReply(writer, reply) != nil {
+			return
+		}
+	}
+}
+
+func writeReply(writer *resp.Writer, reply resp.Value) error {
+	if err := writer.WriteValue(reply); err != nil {
+		return err
+	}
+	return writer.Flush()
 }
