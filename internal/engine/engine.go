@@ -2,18 +2,32 @@ package engine
 
 import (
 	"context"
+	"log"
 	"time"
 
+	"github.com/CatIsApple/GoRedis/internal/persist"
 	"github.com/CatIsApple/GoRedis/internal/resp"
 	"github.com/CatIsApple/GoRedis/internal/store"
 )
 
-// Journal은 SET과 EXPIRE의 결과를 재시작 후 복원할 수 있도록 기록한다.
-// 두 메서드가 성공하면 실행기는 메모리에 같은 변경을 적용하고 클라이언트에 응답한다.
+// Journal은 한 쓰기 명령으로 생긴 변경을 현재 증분 AOF에 기록한다.
+// 기록에 성공하면 실행기가 메모리에 같은 변경을 적용하고 클라이언트에 응답한다.
 type Journal interface {
 	AppendSet(key, value string) error
+	AppendSetExpireAt(key, value string, deadlineMS int64) error
+	AppendMSet(pairs []store.Pair) error
+	AppendHSet(key string, fields []store.Pair, create bool) error
+	AppendDel(keys []string) error
 	AppendExpireAt(key string, deadlineMS int64) error
 }
+
+// 스냅샷 경계를 명령 사이에 잡아야 같은 변경이 RDB와 증분 AOF에 중복되지 않는다.
+type rewriter interface {
+	ShouldRewrite() bool
+	Rewrite(db *store.Store) error
+}
+
+var _ rewriter = (*persist.AOF)(nil)
 
 // Engine은 클라이언트 명령과 복제 작업을 하나의 고루틴에서 차례로 실행한다.
 type Engine struct {
@@ -26,6 +40,7 @@ type Engine struct {
 type state struct {
 	db          *store.Store
 	journal     Journal
+	rewriter    rewriter
 	follower    bool
 	subscribers map[chan Change]struct{}
 }
@@ -36,7 +51,8 @@ func New(ctx context.Context) *Engine {
 
 // NewWithStore는 시작 시 준비한 키 공간의 소유권을 primary 실행 고루틴에 넘긴다.
 func NewWithStore(ctx context.Context, db *store.Store, journal Journal) *Engine {
-	return start(ctx, &state{db: db, journal: journal, subscribers: make(map[chan Change]struct{})})
+	r, _ := journal.(rewriter)
+	return start(ctx, &state{db: db, journal: journal, rewriter: r, subscribers: make(map[chan Change]struct{})})
 }
 
 // NewFollower는 첫 전체 동기화를 기다리는 읽기 전용 실행기를 만든다.
@@ -65,6 +81,11 @@ func (e *Engine) run(ctx context.Context, s *state) {
 			if s.db != nil {
 				s.db.PurgeExpired(20)
 			}
+			if s.rewriter != nil && s.rewriter.ShouldRewrite() {
+				if err := s.rewriter.Rewrite(s.db); err != nil {
+					log.Printf("automatic AOF rewrite: %v", err)
+				}
+			}
 		case work := <-e.requests:
 			work(s)
 		}
@@ -89,7 +110,7 @@ func (e *Engine) call(work func(*state)) bool {
 
 // Execute는 명령의 응답을 기다린다. 실행기가 종료됐으면 ok는 false다.
 func (e *Engine) Execute(command resp.Value) (reply resp.Value, ok bool) {
-	ok = e.call(func(s *state) { reply = s.execute(command) })
+	ok = e.call(func(s *state) { reply = s.execute(command, time.Now().UnixMilli()) })
 	return reply, ok
 }
 
