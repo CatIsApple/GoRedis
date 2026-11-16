@@ -124,3 +124,121 @@ redis-cli INCR visits
 기본 `-appendfsync everysec`은 증분 기록을 운영체제에 쓰고 약 1초마다 백그라운드에서 디스크에 동기화합니다. 전원 장애가 나면 아직 동기화되지 않은 최근 쓰기가 유실될 수 있습니다. 이전 GoRedis처럼 매 쓰기 응답 전에 동기화하려면 `-appendfsync always`를, 운영체제에 동기화를 맡기려면 `-appendfsync no`를 사용합니다.
 
 기본 파일은 서버를 실행한 위치의 `appendonlydir/`에 생깁니다. 이전 버전의 단일 `appendonly.aof`만 있으면 처음 시작할 때 읽어 RDB 기준본을 만들고 원본 파일은 보관합니다. 그 뒤에는 manifest를 기준으로 복구합니다. `-aof /data/app.aof`처럼 이름을 직접 지정하면 `/data/app.aof.d/`에 저장합니다. 재시작 시 같은 경로를 사용하며, `-aof=""`는 메모리 전용 모드입니다.
+
+## Primary와 읽기 전용 replica 실행
+
+각 명령을 별도 터미널에서 실행합니다. primary가 RDB와 증분 AOF를 소유하고, replica는 메모리에 복사본을 유지합니다.
+
+```sh
+go run ./cmd/goredis -addr 127.0.0.1:6379
+go run ./cmd/goredis -addr 127.0.0.1:6380 -replicaof 127.0.0.1:6379
+```
+
+`redis-cli`가 설치돼 있다면 두 포트의 동작을 확인할 수 있습니다.
+
+```sh
+redis-cli -p 6379 SET name alice    # OK
+redis-cli -p 6380 GET name          # 복제 반영 후 "alice"
+redis-cli -p 6379 EXPIRE name 30    # 1
+redis-cli -p 6380 TTL name          # 복제 반영 후 남은 초
+redis-cli -p 6380 SET name bob      # READONLY
+```
+
+1. replica가 primary에 접속하면 [`Subscribe`](../internal/engine/replication.go)가 단일 실행기 안에서 스냅샷 생성과 변경 구독을 함께 처리합니다. 스냅샷을 전송하는 동안 들어온 쓰기는 구독 큐에 쌓입니다.
+2. replica는 모든 키를 임시 저장소에 모은 뒤 스냅샷 종료 신호를 받으면 저장소를 한 번에 교체합니다. 첫 동기화가 끝나기 전에는 `GET`, `MGET`, `HGET`, `TYPE`, `EXISTS`, `TTL`로 키를 조회하면 `LOADING`을 반환합니다. [수신 코드](../internal/replica/follow.go)
+3. 이후 primary는 변경된 키의 값과 절대 만료 시각을 실행 순서대로 보냅니다. `MSET`과 다중 `DEL`은 각 명령의 변경을 한 메시지에 담아 replica에서도 한 번에 적용합니다. 기존 해시의 `HSET`은 요청에 포함된 필드만 전송하고 replica가 한 번에 적용합니다. 해시의 만료 시각을 바꾸면 전체 필드와 새 기한을 함께 보내므로, replica에서 이전 기한이 먼저 지나도 값을 복원할 수 있습니다. 복제는 비동기이므로 primary가 쓰기를 승인한 직후 replica에서 읽으면 이전 값이 보일 수 있습니다. [전송 코드](../internal/replica/stream.go)
+4. 연결이 끊기거나 전송이 밀려 구독 큐가 가득 차면 다시 접속해 전체 동기화를 수행합니다. replica는 재연결 중에도 마지막으로 반영한 데이터를 제공하며 각 키의 만료 시각을 적용합니다.
+
+노드 간 통신은 GoRedis 전용 RESP2 명령 `GOREDIS.SYNC`를 사용합니다. Redis 클라이언트로 일반 명령을 보낼 수 있으며, 복제에는 양쪽 모두 GoRedis 노드를 사용합니다. 이전 버전의 replica가 지원하지 않는 다중 `MSET` 또는 `DEL` 메시지를 받으면 재연결해 전체 스냅샷을 다시 받습니다. 해시가 포함된 키 공간을 복제하려면 replica에도 해시를 지원하는 버전이 필요합니다.
+
+## 슬롯 분산과 primary 자동 승격
+
+GoRedis는 Redis Cluster와 같은 CRC16/XMODEM 규칙으로 키를 0부터 16,383까지의 슬롯 중 하나에 배정합니다. 예를 들어 `{user:42}:name`과 `{user:42}:city`는 중괄호 안의 `user:42`가 같아서 둘 다 슬롯 15880에 속합니다. 여러 키를 한 명령으로 읽거나 쓰려면 모든 키가 같은 슬롯에 있어야 합니다. [Redis Cluster 명세](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)
+
+예제 설정은 아래 세 샤드를 만듭니다. 각 행의 노드 세 개가 한 Raft 그룹입니다. 각 그룹을 처음 구성할 때는 설정에 적힌 첫 노드가 투표자 목록을 등록합니다. `addr`는 클라이언트가 접속할 주소이고 `raft`는 같은 샤드 노드끼리 로그와 투표를 교환할 주소입니다. 노드 간 TCP에는 인증과 암호화가 없으므로 여러 호스트에서 실행할 때는 신뢰하는 내부망 주소를 사용합니다. [로컬 설정](../examples/cluster.json)
+
+| 슬롯 범위 | 클라이언트 포트 | Raft 포트 |
+| --- | --- | --- |
+| 0–5461 | 7100, 7103, 7106 | 17100, 17103, 17106 |
+| 5462–10922 | 7101, 7104, 7107 | 17101, 17104, 17107 |
+| 10923–16383 | 7102, 7105, 7108 | 17102, 17105, 17108 |
+
+### 로컬에서 실행하고 primary 교체 확인하기
+
+저장소 루트에서 실습 전용 `bash` 셸을 열고 아래 블록을 순서대로 실행합니다. Go, `redis-cli` 7 이상, Python 3을 사용합니다. 새 임시 디렉터리에 노드별 로그와 데이터를 남기므로 실습을 반복할 수 있습니다. `-cluster-dir`을 생략하면 각 노드는 `cluster-data/<노드 ID>/`를 사용합니다.
+
+```bash
+bash
+```
+
+```bash
+run_dir=$(mktemp -d)
+go build -o "$run_dir/goredis" ./cmd/goredis
+start_node() {
+  "$run_dir/goredis" -addr "127.0.0.1:$1" -cluster-config examples/cluster.json \
+    -cluster-dir "$run_dir/data-$1" >>"$run_dir/$1.log" 2>&1 &
+  echo "$!" >"$run_dir/$1.pid"
+}
+stop_nodes() {
+  for pid in $(jobs -pr); do kill "$pid" 2>/dev/null; done
+  wait
+}
+trap stop_nodes EXIT
+for port in {7100..7108}; do start_node "$port"; done
+echo "$run_dir"
+for attempt in {1..50}; do
+  redis-cli --raw -p 7100 CLUSTER INFO 2>/dev/null | grep -q '^cluster_state:ok' && break
+  sleep 0.2
+done
+```
+
+`CLUSTER INFO`에 `cluster_state:ok`가 표시되면 세 샤드의 primary가 준비된 상태입니다. 7100에서 슬롯 15880에 접근하면 `MOVED`에 담당 primary 주소가 나옵니다. `redis-cli -c`는 그 주소로 요청을 다시 보냅니다.
+
+```bash
+redis-cli -p 7100 CLUSTER INFO
+redis-cli -c -p 7100 SET bar first                              # 슬롯 5061, 첫 샤드
+redis-cli -c -p 7100 SET c second                               # 슬롯 7365, 둘째 샤드
+redis-cli -p 7100 CLUSTER KEYSLOT '{user:42}:name'              # 15880
+redis-cli -p 7100 GET '{user:42}:name'                          # MOVED 15880 ...
+redis-cli -c -p 7100 MSET '{user:42}:name' alice '{user:42}:city' Seoul
+redis-cli -c -p 7100 MGET '{user:42}:name' '{user:42}:city'    # alice, Seoul
+redis-cli -c -p 7100 MSET '{user:42}:name' bob '{user:43}:city' Busan  # CROSSSLOT
+```
+
+`CLUSTER SLOTS`의 각 행에는 시작 슬롯, 끝 슬롯, 현재 primary, 설정에 등록된 나머지 노드가 차례로 나옵니다. 이 목록에는 접속이 끊긴 replica도 포함될 수 있습니다. 아래 명령은 슬롯 15880의 현재 primary를 찾아 해당 실습 프로세스만 강제 종료합니다. 선출이 끝나면 기존 값 `alice`가 보이고, 같은 키에 다시 쓸 수 있습니다.
+
+```bash
+primary_port() {
+  redis-cli -2 --json -p 7100 CLUSTER SLOTS | python3 -c '
+import json, sys
+print(next(row[2][1] for row in json.load(sys.stdin) if row[0] <= 15880 <= row[1]))'
+}
+old_port=$(primary_port)
+if [[ "$old_port" =~ ^(7102|7105|7108)$ ]]; then
+  old_pid=$(cat "$run_dir/$old_port.pid")
+  kill -KILL "$old_pid"
+  wait "$old_pid" 2>/dev/null
+fi
+for attempt in {1..50}; do
+  value=$(redis-cli --raw -c -p 7100 GET '{user:42}:name' 2>/dev/null)
+  [[ "$value" == alice ]] && break
+  sleep 0.2
+done
+echo "기존 primary $old_port, 현재 primary $(primary_port), 복구한 값 $value"
+redis-cli -c -p 7100 SET '{user:42}:name' bob
+start_node "$old_port"     # 같은 주소와 데이터 디렉터리로 재합류
+```
+
+새 primary가 정상인 동안 되돌아온 이전 primary는 replica로 합류해 누락된 로그를 따라잡습니다. 실습 셸에서 `exit`를 실행하면 시작한 서버가 모두 종료됩니다. 전체 재시작을 실험할 때는 셸을 열어 둔 채 `stop_nodes`를 실행하고 앞의 `for port in {7100..7108}; do start_node "$port"; done`을 다시 실행합니다. 각 노드는 기존 디렉터리에서 Raft 스냅샷과 로그를 읽습니다.
+
+### 샤드별 명령 실행과 장애 범위
+
+- 각 샤드의 primary는 명령을 한 순서로 실행합니다. 서로 다른 샤드는 독립적으로 진행합니다. 현재 구현은 `GET` 등 읽기도 샤드의 Raft 로그를 거쳐 커밋하므로 읽기에도 복제 지연과 로그 기록 비용이 듭니다.
+- TTL은 커밋된 명령의 시각으로 판단합니다. 클러스터에서 만료된 값의 메모리는 해당 키에 다시 접근하거나 이후 명령 시각으로 스냅샷을 만들 때 회수됩니다.
+- 샤드의 과반이 응답하면 명령을 커밋할 수 있습니다. 예제에서 primary 하나가 꺼지면 남은 둘이 새 primary를 선출합니다. 둘이 꺼지면 해당 샤드는 새 요청을 완료할 수 없고, 과반이 살아 있는 다른 샤드는 계속 처리합니다. 명령을 제출한 직후 primary가 바뀌면 해당 클라이언트는 결과 미확정 오류를 받을 수 있습니다. 이때 `INCR`를 그대로 다시 보내면 값이 두 번 증가할 수 있습니다.
+- Redis Cluster는 노드 간에 Redis Cluster Bus를 사용합니다. GoRedis 클러스터는 샤드별 Raft를 사용하므로 구성원은 모두 GoRedis로 실행합니다. 슬롯 범위와 투표 구성원은 시작할 때 설정 파일로 정합니다. 온라인 샤드 추가와 슬롯 이동은 지원하지 않습니다. [Redis Cluster 명세](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)
+
+### TODO
+
+- [ ] 단독 서버와 클러스터에서 RESP 요청부터 응답까지의 초당 완료 명령 수와 p99 지연을 측정한다.
+- [ ] 커널 수준 네트워크 최적화는 명령 처리까지 포함한 부하 테스트에서 시스템 호출이나 소켓 처리가 병목으로 확인될 때 검토한다.
