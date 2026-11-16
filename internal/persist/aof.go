@@ -17,6 +17,7 @@ import (
 // AOF는 단일 실행기가 소유하는 Append Only File이다. 한 명령은 RESP 배열
 // 하나로 기록하므로 키와 값에 개행이나 NUL 바이트가 있어도 경계를 복원할 수 있다.
 type AOF struct {
+	syncPolicy
 	file   *os.File
 	writer *resp.Writer
 	failed error
@@ -25,6 +26,13 @@ type AOF struct {
 // Open은 빈 키 공간에 AOF를 처음부터 재생한 다음, 같은 파일을 쓰기용으로
 // 넘긴다. 오류를 반환하면 호출자는 부분적으로 복구된 키 공간을 버린다.
 func Open(path string, db *store.Store) (*AOF, error) {
+	return OpenWithFsync(path, db, "everysec")
+}
+
+func OpenWithFsync(path string, db *store.Store, policy string) (*AOF, error) {
+	if err := validateFsync(policy); err != nil {
+		return nil, err
+	}
 	f, err := openLockedFile(path)
 	if err != nil {
 		return nil, err
@@ -36,7 +44,9 @@ func Open(path string, db *store.Store) (*AOF, error) {
 	// 이전 만료 시각을 뒤의 명령이 연장했을 수 있다. 전체 재생이 끝난 시점의
 	// 최종 기한을 기준으로, 서버가 꺼져 있는 동안 만료된 키까지 정리한다.
 	db.PurgeExpired(math.MaxInt)
-	return &AOF{file: f, writer: resp.NewWriter(f)}, nil
+	a := &AOF{file: f, writer: resp.NewWriter(f)}
+	a.startFsync(policy)
+	return a, nil
 }
 
 type tailMode uint8
@@ -368,6 +378,10 @@ func (a *AOF) append(commands ...[]string) error {
 	if a.failed != nil {
 		return a.failed
 	}
+	// 이전 비동기 fsync가 실패하면 디스크 동기화에 성공할 때까지 새 쓰기를 보류한다.
+	if err := a.syncError(); err != nil {
+		return err
+	}
 	start, err := a.file.Seek(0, io.SeekEnd)
 	if err != nil {
 		a.failed = err
@@ -383,12 +397,12 @@ func (a *AOF) append(commands ...[]string) error {
 			break
 		}
 	}
-	// 명령의 모든 레코드를 파일에 보낸 뒤 디스크 동기화를 기다린다.
+	// 명령의 모든 레코드를 파일에 보낸 뒤 설정된 appendfsync 정책을 적용한다.
 	if err == nil {
 		err = a.writer.Flush()
 	}
 	if err == nil {
-		err = a.file.Sync()
+		err = a.syncWrites()
 	}
 	if err != nil {
 		// 일부 바이트만 기록됐을 수 있다. 이번 쓰기의 첫 레코드 경계로 되돌리고 이후
@@ -399,7 +413,7 @@ func (a *AOF) append(commands ...[]string) error {
 	return nil
 }
 
-// Close는 파일과 파일 잠금을 함께 해제한다. 개별 명령은 이미 Sync를 마쳤다.
 func (a *AOF) Close() error {
-	return a.file.Close()
+	a.stopFsync()
+	return errors.Join(a.syncFile(a.file), a.file.Close())
 }
